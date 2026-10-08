@@ -1692,6 +1692,17 @@ export async function handle(
                     }
                 }
             }
+            // #2283 sub-defect 1: emit [window-change] when the per-session resolution
+            // triple (model/source/base) moves mid-session. Placed pre output-headroom so
+            // #2096's per-request max_tokens reservation can't read as a base change.
+            {
+                const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
+                const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
+                if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
+                    log("info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s}) (#2283)`);
+                }
+                if (session.metadata) session.metadata.lastWindowResolution = curRes;
+            }
             let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
             // Fallback-derived windows are optimistic guesses: never let the
             // output-headroom reservation push the effective window below the

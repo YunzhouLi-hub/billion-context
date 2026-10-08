@@ -2454,6 +2454,13 @@ export async function preflightCompressIfNeeded(
     const textBudget = Math.max(0, compressionTarget - imageTokens);
     const decisionTrigger = Math.max(Math.max(0, baselineFloor - imageTokens), textChannel);
     const triggerFires = imageTokens >= compressionTarget || decisionTrigger >= textBudget;
+    // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
+    // EVERY request (not only when preflight triggers) — the offline data source for the
+    // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
+    if (opts.debug) {
+        const billed = session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : "none";
+        log("debug", `[${session.id}] [usage-vs-est] upstream-billed=${billed} est=${Math.round(textEstimate)} k̂=${kFactor !== undefined ? kFactor.toFixed(2) : "n/a"} route=${currentOrigin ?? "?"} model=${model ?? "?"} baseline-grade=${session.stats.lastInputTokensSource ?? "none"} (#2283)`);
+    }
     if (limit <= 0 || !model || !triggerFires) return prepared;
     // #2313: an estimate may not block the forward. The trigger above can
     // fire on the calibrated chars/4 estimate alone; when the current
