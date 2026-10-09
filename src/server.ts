@@ -2421,7 +2421,7 @@ export async function preflightCompressIfNeeded(
     const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
     const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
     if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
-        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${baselineOrigin}, request now routes to ${currentOrigin} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
+        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${maskUrlForLog(baselineOrigin)}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
         baselineFloor = 0;
     }
     // #1933 F1: scale the local text estimate by the per-route calibration
