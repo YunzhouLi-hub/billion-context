@@ -89,6 +89,43 @@ export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     return typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS;
 }
 
+// #2503: dsh's title-gen sidecar stamps no persona header, and its output
+// budget is host-sized, not bili-sized: dsh 0.2.1-alpha.2 raised the base
+// bundle preset maxOutputTokens 64 -> 4096 ("a ceiling against runaway
+// output" — reasoning tokens count), so the <=200 heuristic above now misses
+// it: the title request looks like a main turn and, under the #1916 dsh
+// persona fingerprint, forks onto a persisted |sub:<fp> ghost session instead
+// of riding the #388 verbatim passthrough (e2e scenario A / #2241 fails).
+// Match on the fixed first line of dsh's title system prompt (stable on the
+// wire across rc.2/alpha.2; dsh-session-title-first-prompt-llm). The same
+// no-tools veto as isSideRequest keeps any future main turn out of this path.
+// The caller must gate on x-bili-plugin=dsh (evidence-per-client discipline,
+// cf. dshPersonaFingerprintApplies in src/session-id.ts).
+export const DSH_TITLE_SYSTEM_PREFIX = "Create a concise title for an AI coding-assistant session";
+export function isDshTitleRequest(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    const msgs = p.messages;
+    if (!Array.isArray(msgs)) return false;
+    for (const m of msgs) {
+        if (!m || typeof m !== "object" || (m as Record<string, unknown>).role !== "system") continue;
+        const c = (m as Record<string, unknown>).content;
+        let text = "";
+        if (typeof c === "string") {
+            text = c;
+        } else if (Array.isArray(c)) {
+            for (const part of c) {
+                if (part && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string") {
+                    text += (part as Record<string, unknown>).text as string;
+                }
+            }
+        }
+        if (text.startsWith(DSH_TITLE_SYSTEM_PREFIX)) return true;
+    }
+    return false;
+}
+
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
 // ONE home and an exhaustive truth-table test. They are PURE — the two effects
 // that guard demotion (detectAcpArtifacts' full-history re-encode and the
