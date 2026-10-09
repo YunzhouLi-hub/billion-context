@@ -67,6 +67,10 @@ export async function prepareAnthropic(
     let clientCacheControls: Map<string, unknown> | undefined;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
+    // #2483: single source for the effective render strategy — processTurn, the
+    // diag log and Prepared must all report what was actually rendered (the
+    // log label used to hardcode "text-only" and lie under renderNone).
+    const renderStrategy = knobRenderNone() ? "none" : "text-only";
 
     // #1085: sticky head-system anchor — freeze the client's own `system` text
     // at first sight and forward it byte-stable; detected changes ride as
@@ -201,7 +205,7 @@ export async function prepareAnthropic(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -226,7 +230,7 @@ export async function prepareAnthropic(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
         // stops nagging — including the emergency path, per session.
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
@@ -388,7 +392,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
 }
 
 

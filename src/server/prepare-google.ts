@@ -22,6 +22,7 @@ import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
+import { renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge } from "./budget.js";
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
@@ -87,6 +88,9 @@ export async function prepareGoogle(
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
+    // #2483: this lane used to ignore renderNone entirely (hardcoded "text-only"
+    // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
+    const renderStrategy = knobRenderNone() ? "none" : "text-only";
 
     const strippedCarriers = stripEmbeddedChainCarriers(parsed, "google");
     if (strippedCarriers > 0) {
@@ -147,11 +151,11 @@ export async function prepareGoogle(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
-        // The fold from last turn's compress has materialized in state — future
-        // usage reports are post-fold reality, drop the credit.
+        // The fold from last turn's compress has now materialized in state —
+        // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         if (foldCoveredBefore !== null && !isTitleGen && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
@@ -161,8 +165,9 @@ export async function prepareGoogle(
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
-        // Drop sub-viability fragments before any consumer sees them (the
-        // kernel validates a compress batch atomically).
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
@@ -171,7 +176,7 @@ export async function prepareGoogle(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
@@ -193,7 +198,7 @@ export async function prepareGoogle(
         // and round-2 re-requests — skipping them here would fork the prefix
         // at every fold and collapse the upstream cache hit.
         if (shouldInject) sysParts.push(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
-        else if (!isTitleGen) {
+        else if (!isTitleGen && renderStrategy !== "none") {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
             if (tagsOnly) sysParts.push(tagsOnly);
@@ -277,7 +282,7 @@ export async function prepareGoogle(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes,             renderTags: renderStrategy } as Prepared;
 }
 
 /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of
@@ -296,7 +301,7 @@ export function prepareGoogleCountTokens(
         const { msgs } = googleToCore(parsed);
         // Read-only preview: the store rides in so placeholder substitution is
         // counted, but nothing is adopted (state is discarded here too).
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: usageGradeInputBaseline(session), renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
