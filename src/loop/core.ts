@@ -37,7 +37,7 @@ import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithDraftClose } from "../degenerate-turn.js";
-import { safePrefix, safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -409,7 +409,13 @@ export async function* runCompressLoop(
         // #2131: also hand over the exact message count — bodies above the
         // forensics cap are stored clipped and parse to zero messages.
         const wireObj = requestOptions.wireTransform ? requestOptions.wireTransform(body) : body;
-        const wireBodyStr = JSON.stringify(wireObj);
+        // #816 family: a lone surrogate anywhere in the body (model-authored
+        // text, pre-#816 persisted state) serializes as an unpaired \uXXXX
+        // escape and strict upstreams reject the WHOLE body (non-retryable
+        // 400). Scrub once at the single loop send chokepoint; the same string
+        // then feeds resign and forensics so all three views agree (this also
+        // de-duplicates the previous double JSON.stringify of the same body).
+        const wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         // #2131 follow-up: the message array lives under `messages` (chat),
         // `input` (Responses) or `contents` (Google) depending on wire shape.
@@ -434,7 +440,7 @@ export async function* runCompressLoop(
             {
                 method: "POST",
                 headers: requestOptions.headers,
-                body: JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(body) : body),
+                body: wireBodyStr,
                 ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
             },
             undefined,
