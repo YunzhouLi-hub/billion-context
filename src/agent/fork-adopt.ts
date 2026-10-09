@@ -4,13 +4,16 @@ import type { CoreMessage } from "acp-kernel";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 
 /**
- * Agent-side fork adoption (#2399): the dsh native extension reads its host
- * session header (parentSession + isSeeded), and before a fork child's first
- * model request replays into the proxy, adopts the parent conversation's
- * compression state through the plugin fork protocol (PLUGIN.md §8). This
- * module is the client half: it projects the outgoing OpenAI body the same
- * way the server's incomingCoreMessages does, matches the longest parent
- * prefix by identity hash, and posts the fork receipt.
+ * Agent-side fork adoption (#2399): a host extension reads its session header
+ * (parent lineage marker — dsh stamps parentSession+isSeeded, pi/omp stamp
+ * parentSession alone, opencode V2 derives it from session.created), and
+ * before a fork child's first model request replays into the proxy, adopts
+ * the parent conversation's compression state through the plugin fork
+ * protocol (PLUGIN.md §8). This module is the client half: it projects the
+ * outgoing chat body (openai/anthropic dialects) the same way the server's
+ * incomingCoreMessages does, matches the longest parent prefix by identity
+ * hash, and posts the fork receipt. Wires without a client-side projection
+ * (responses/google) are gated off BEFORE any network request (#2469).
  *
  * HASH PARITY CONTRACT: forkStableJson/forkIdentityHashOf/forkOrderHashOf
  * below are byte-for-byte replicas of src/plugin.ts stableJson/
@@ -104,10 +107,10 @@ export function anthropicBodyToCore(body: unknown): CoreMessage[] | null {
 }
 
 /** Project an outgoing chat body of either chat dialect. Responses/google
- *  bodies return null — the fork snapshot prefix match is text/role based and
- *  those dialects are not projected client-side yet, so adoption degrades as a
- *  transient "body unmappable" and retries up to the coordinator's cap (the
- *  child simply starts fresh, as today). */
+ *  bodies return null — those dialects are not projected client-side yet; the
+ *  wire gate (#2469, see tryForkAdoption / createForkAdopter) ends adoption
+ *  terminally BEFORE any network request for them, so this null is defense in
+ *  depth for direct callers, not a retryable condition. */
 export function chatBodyToCore(body: unknown): CoreMessage[] | null {
     const format = detectWireFormat(body);
     if (format === "anthropic") return anthropicBodyToCore(body);
@@ -134,12 +137,61 @@ function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; 
     return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages };
 }
 
-async function codeOf(res: Response): Promise<string> {
+// #2469: error bodies are read BOUNDED — a hostile or misconfigured upstream
+// can stream an unbounded body on a 4xx, and adoption must degrade with the
+// diagnostics it actually needs (code + a short error), never hang or buffer.
+const ERROR_BODY_MAX_BYTES = 1024;
+const ERROR_FIELD_MAX_CHARS = 120;
+
+function sanitizeDiagnostic(value: string): string {
+    const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+    return cleaned.length > ERROR_FIELD_MAX_CHARS ? `${cleaned.slice(0, ERROR_FIELD_MAX_CHARS - 1)}…` : cleaned;
+}
+
+/** Read at most ERROR_BODY_MAX_BYTES of an error response and extract the
+ *  proxy's `{ code, error }` fields, sanitized (control characters stripped,
+ *  whitespace collapsed, length-capped). Non-JSON / oversized / truncated
+ *  bodies yield empty fields — callers fall back to the status-only reason. */
+async function readBoundedErrorBody(res: Response): Promise<{ code: string; error: string }> {
     try {
-        const parsed = await res.json() as { code?: unknown };
-        return typeof parsed.code === "string" ? parsed.code : "";
+        const body = res.body;
+        if (body === null) return { code: "", error: "" };
+        const reader = body.getReader();
+        const parts: Uint8Array[] = [];
+        let size = 0;
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done || value === undefined) break;
+            const room = ERROR_BODY_MAX_BYTES - size;
+            if (room <= 0) break;
+            const chunk = value.byteLength <= room ? value : value.subarray(0, room);
+            parts.push(chunk);
+            size += chunk.byteLength;
+            if (size >= ERROR_BODY_MAX_BYTES) {
+                void reader.cancel().catch(() => undefined);
+                break;
+            }
+        }
+        const joined = new Uint8Array(size);
+        let offset = 0;
+        for (const part of parts) {
+            joined.set(part, offset);
+            offset += part.byteLength;
+        }
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(new TextDecoder("utf-8").decode(joined));
+        } catch {
+            return { code: "", error: "" };
+        }
+        if (parsed === null || typeof parsed !== "object") return { code: "", error: "" };
+        const rec = parsed as Record<string, unknown>;
+        return {
+            code: typeof rec.code === "string" ? sanitizeDiagnostic(rec.code) : "",
+            error: typeof rec.error === "string" ? sanitizeDiagnostic(rec.error) : "",
+        };
     } catch {
-        return "";
+        return { code: "", error: "" };
     }
 }
 
@@ -159,19 +211,33 @@ export async function tryForkAdoption(opts: {
     log?: (line: string) => void;
 }): Promise<ForkAdoptionResult> {
     const doFetch = opts.fetchImpl ?? fetch;
+    // #2469: deterministic protocol mismatch ends adoption BEFORE any network
+    // request — retrying can never grow the client's projection capability.
+    // Only the chat dialects are projected client-side today; responses/google
+    // get no snapshot GET, no fork POST, no retry budget.
+    const wire = detectWireFormat(opts.body);
+    if (wire === "responses" || wire === "google") {
+        return { outcome: "degraded", reason: `wire unsupported (${wire})` };
+    }
+    const core = chatBodyToCore(opts.body);
+    if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
     const snapshotUrl = `${opts.base}/__bili/plugin/snapshot?conversationId=${encodeURIComponent(opts.parentConversationId)}`;
     for (let attempt = 0; attempt < 2; attempt += 1) {
         let snapshot: Awaited<ReturnType<typeof snapshotOf>>;
         try {
             const res = await doFetch(snapshotUrl, { signal: AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS) });
-            if (!res.ok) return { outcome: "degraded", reason: `snapshot http ${res.status}` };
+            if (!res.ok) {
+                // #2469: surface the proxy's bounded diagnostics (e.g. 409
+                // SNAPSHOT_UNAVAILABLE + why) instead of hiding them behind a
+                // bare status code.
+                const detail = await readBoundedErrorBody(res);
+                return { outcome: "degraded", reason: `snapshot http ${res.status}${detail.code ? ` ${detail.code}` : ""}${detail.error ? ` (${detail.error})` : ""}` };
+            }
             snapshot = snapshotOf(await res.json());
         } catch (err) {
             return { outcome: "degraded", reason: `snapshot error ${err instanceof Error ? err.message : String(err)}` };
         }
         if (snapshot === null) return { outcome: "degraded", reason: "snapshot malformed" };
-        const core = chatBodyToCore(opts.body);
-        if (core === null || core.length === 0) return { outcome: "degraded", reason: "body unmappable" };
         const branchPoint = matchForkPrefix(core, snapshot.orderedMessages);
         if (branchPoint === 0) return { outcome: "degraded", reason: "no prefix match" };
         const prefix = snapshot.orderedMessages.slice(0, branchPoint);
@@ -207,7 +273,7 @@ export async function tryForkAdoption(opts: {
             opts.log?.(`fork child ${opts.childConversationId} adopted parent ${opts.parentConversationId} at branch point ${branchPoint}${replayed ? " (replayed)" : ""} (#2399)`);
             return { outcome: "adopted", branchPoint, replayed };
         }
-        const code = await codeOf(res);
+        const code = (await readBoundedErrorBody(res)).code;
         if (res.status === 409 && code === "PARENT_REVISION_CONFLICT" && attempt === 0) {
             opts.log?.(`fork for ${opts.childConversationId} hit parent revision conflict, retrying once with a fresh snapshot (#2399)`);
             continue;
@@ -253,11 +319,12 @@ export type ForkAdoptInput = { base: string; parent: string; child: string; body
  *    degraded) marks the child done;
  *  - bodies with no parseable payload (undefined — e.g. opencode V2's ws
  *    handshake synthetic request) and side-shaped bodies skip WITHOUT
- *    consuming an attempt; responses/google bodies degrade as transient
- *    "body unmappable" and retry up to the cap; a manifest-incapable proxy
- *    terminates after one probe;
- *  - never throws: an adoption failure degrades to today's behavior (fresh
- *    conversation, preflight refolds the replayed history). */
+ *    consuming an attempt; a deterministically unsupported wire
+ *    (responses/google — no client-side projection yet, #2469) terminates
+ *    BEFORE any network request, including the manifest probe; a
+ *    manifest-incapable proxy terminates after one probe;
+ *  - never throws: an adoption failure degrades to today's behavior (the
+ *    session continues without inherited compression state). */
 /** Side-shaped request body: no tools AND a tiny output budget (host
  *  title-gen / auto-review sidecars). Mirrors the server-side side heuristic
  *  budget bound (#388: maxTokens <= 200). Exported for tests. */
@@ -276,6 +343,16 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
     const inflight = new Map<string, Promise<void>>();
     const run = async (input: ForkAdoptInput): Promise<void> => {
         attempts.set(input.child, (attempts.get(input.child) ?? 0) + 1);
+        // #2469: retrying can never grow the client's projection capability,
+        // so an unsupported wire ends this child's adoption before ANY network
+        // request (manifest probe included). tryForkAdoption carries the same
+        // guard for direct callers.
+        const wire = detectWireFormat(input.body);
+        if (wire === "responses" || wire === "google") {
+            log(`fork adoption for ${input.child} skipped — ${wire} wire requests are not supported by public fork adoption yet; the child starts fresh (#2469/#2399)`);
+            done.add(input.child);
+            return;
+        }
         if (!(await manifestForkCapable(input.base, opts?.fetchImpl))) {
             log(`fork adoption for ${input.child} skipped — the proxy does not advertise the fork capability (#2399)`);
             done.add(input.child);
@@ -293,7 +370,7 @@ export function createForkAdopter(log: (line: string) => void, opts?: { maxAttem
             done.add(input.child);
             return;
         }
-        log(`fork adoption for ${input.child} degraded (${result.reason}) — the session starts fresh and preflight refolds the replayed history (#2399)`);
+        log(`fork adoption for ${input.child} degraded (${result.reason}) — the session continues without inherited compression state (#2399/#2469)`);
         // Only transient failures (network / 5xx / unmappable body) leave the
         // window open so a later request retries up to maxAttempts; every other
         // outcome is terminal. Once this child's stamped request has landed, a
