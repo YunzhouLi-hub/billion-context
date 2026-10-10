@@ -273,12 +273,14 @@ test("(F) extracted protocol modules keep the side-lane boundary (#1440 P2 cut 2
 // in handle() before the extraction (moved, not newly coupled). #2500 adds
 // isServerToolUtilityCall — a pure structural predicate (no threshold, no
 // session state) that handle() consults for the restoreOutputBudget skip and
-// the side-lane reason label, same category as isSideRequest itself.
+// the side-lane reason label, same category as isSideRequest itself. #2503
+// adds isDshTitleRequest — same category: a pure dsh title-sidecar predicate
+// (no threshold, no session state) consulted only to set sideIntent.
 test("(G) extracted pipeline module keeps the side-lane boundary (#1440 P2 cut 3)", () => {
     const text = readFileSync(fileURLToPath(new URL("../src/server/handle.ts", import.meta.url)), "utf8");
     const laneInternals = /\bSIDE_REQUEST_MAX_TOKENS\b|\bSIDE_REQUEST_AGENTS\b|\bDemoteGateSignals\b|\bSideLaneSignals\b|\bSideLaneDecision\b|\bBILI_TOOL_NAMES\b|\bOutputBudgetField\b|\boutputBudgetField\b|\breadOutputBudget\b|\bwriteOutputBudget\b|\b_resetNoOutputCeilingWarningsForTest\b/;
     assert.doesNotMatch(text, laneInternals, "handle.ts must stay decoupled from the side-lane engine internals");
-    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
+    const allowlist = new Set(["hasLeakedBiliToolsOnly", "isDshTitleRequest", "isServerToolUtilityCall", "isSideRequest", "resolveSideLane", "demoteGate", "stripLeakedBiliTools", "restoreOutputBudget", "sideRequestGuard"]);
     let sawImport = false;
     for (const m of text.matchAll(/\{([^}]*)\}\s*from\s*["'][^"']*side-request\.js["']/g)) {
         sawImport = true;

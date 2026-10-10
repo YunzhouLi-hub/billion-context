@@ -180,6 +180,8 @@
 | `diagnostics.rawDumpDir` | string | <state dir>/raw | ACP_RAW_DUMP_DIR | 原始线路转储目录。 |
 | `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | 把上游 4xx 响应落盘以便事后检查。 |
 | `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | 单个 4xx 转储文件的大小上限。 |
+| `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | 调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。 |
+| `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | 调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。 |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | 禁用所有 ACP 标签渲染（原始线路研究模式）。 |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | 停止向请求注入 acp_compress 工具定义。 |
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | 停止向系统提示词附加压缩教条文本。 |
@@ -792,6 +794,8 @@
     "rawDumpDir": null,                   // raw dump 位置；null = <state dir>/raw
     "dump4xx": false,                     // 捕获被拒的 4xx 响应体
     "dump4xxMaxBytes": 2097152,
+    "maxTotalBytes": null,                // 转储目录总字节上限；null = 不限制（#2412）
+    "maxAgeDays": null,                   // 删除超过 N 天的转储文件；null = 关闭
     "renderNone": false,                  // 停止向出站历史注入 mNNNNN 渲染标签
     "noInjectTool": false,                // 抑制 compress 工具注入
     "noCompressPrompt": false,            // 抑制压缩提示文本
@@ -846,10 +850,10 @@
 
 ### `diagnostics`
 
-- **类型：** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
-- **默认：** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
+- **类型：** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; maxTotalBytes?: number; maxAgeDays?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
+- **默认：** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, maxTotalBytes: null, maxAgeDays: null, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
 - **状态：** ACTIVE
-- **说明：** 此前仅有环境变量形态的调试/诊断开关（`ACP_DUMP_BODY`、`ACP_DUMP_REQ`、`ACP_RAW_DUMP_DIR`、`BILI_DUMP_4XX`、`BILI_DUMP_4XX_MAX_BYTES`、`ACP_RENDER_NONE`、`ACP_NO_INJECT_TOOL`、`ACP_NO_COMPRESS_PROMPT`、`ACP_COUNT_TOKENS_PASSTHROUGH`、`ACP_COMPRESS_PROTOCOL`）。除 `compressProtocol` 在启动时一次性解析（同旧环境变量行为）外，其余均按请求实时读取，无需重启。`renderNone` 停止向外发历史注入 `mNNNNN` 渲染标签 —— 仅当你的工作流不需要基于 ref 的压缩时才关闭（#933）。详见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** 此前仅有环境变量形态的调试/诊断开关（`ACP_DUMP_BODY`、`ACP_DUMP_REQ`、`ACP_RAW_DUMP_DIR`、`BILI_DUMP_4XX`、`BILI_DUMP_4XX_MAX_BYTES`、`ACP_RENDER_NONE`、`ACP_NO_INJECT_TOOL`、`ACP_NO_COMPRESS_PROMPT`、`ACP_COUNT_TOKENS_PASSTHROUGH`、`ACP_COMPRESS_PROTOCOL`）。除 `compressProtocol` 在启动时一次性解析（同旧环境变量行为）外，其余均按请求实时读取，无需重启。`renderNone` 停止向外发历史注入 `mNNNNN` 渲染标签 —— 仅当你的工作流不需要基于 ref 的压缩时才关闭（#933）。保留期限约束（#2412）：转储目录只写不删、默认无轮转 —— 实测持续开启 body/SSE 捕获约 63 GB/天，数天内即可写满磁盘。设置 `maxTotalBytes` 和/或 `maxAgeDays` 可为其设限（最旧优先删除，`err-*`/`summary-err-*` 事故证据文件受保护不删，删除动作以 warn 级别记录日志）；两者都不设置则保持无限期保留。详见[环境变量表](#环境变量的配置键对照-2030)。
 
 ### `fakeCompletion`
 
@@ -1608,6 +1612,8 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
+| `BILI_DUMP_MAX_AGE_DAYS` | `diagnostics.maxAgeDays` | unset (off) |
+| `BILI_DUMP_MAX_TOTAL_BYTES` | `diagnostics.maxTotalBytes` | unset (off) |
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | 3600000 (0 disables the log) |
 | `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |

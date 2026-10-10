@@ -185,7 +185,8 @@ jobs:
       - run: node tools/gen-config-docs.mjs check-coverage
 
   # #2170 lane guard: the side-lane decision (#388 passthrough — src/server/
-  # side-request.ts + the lane region of src/server.ts) is regression-critical
+  # side-request.ts + the lane region of src/server/handle.ts, extracted from
+  # src/server.ts by #1440) is regression-critical
   # (the #2156/#2157/#2164 chain). Changing it without touching its dedicated
   # suites has silently shipped regressions before; this job makes the pairing
   # mechanical: lane logic moves ⇔ a side-lane suite moves with it.
@@ -200,13 +201,19 @@ jobs:
         run: |
           set -euo pipefail
           LANE_SUITE_RE='tests/(fork-side-request-lane|side-lane-truth-table|side-lane-invariants|side-request-isolation)\.test\.ts'
-          # Lane logic = src/server/side-request.ts, or lane-symbol lines in src/server.ts.
+          # Lane logic = src/server/side-request.ts, or lane-symbol lines in
+          # src/server.ts / src/server/handle.ts (#1440 extraction moved the
+          # lane region into handle.ts — #2554 review closed that blind spot).
           LANE_DIFF=""
+          LANE_SYMBOLS='demotedSide|sideIntent|sideRequestLike|demoteGate|resolveSideLane|SIDE_REQUEST_MAX_TOKENS|isSideRequest|isDshTitleRequest|DSH_TITLE_SYSTEM_PREFIX|stripLeakedBiliTools|side request|side passthrough|sidePassthrough|side-lane'
           if git diff origin/master...HEAD -- src/server/side-request.ts | grep -qE '^[+-]'; then
             LANE_DIFF="src/server/side-request.ts"
           fi
-          if git diff origin/master...HEAD -- src/server.ts | grep -Eq '^[+-].*(demotedSide|sideIntent|sideRequestLike|demoteGate|resolveSideLane|SIDE_REQUEST_MAX_TOKENS|isSideRequest|stripLeakedBiliTools|side request|side passthrough|sidePassthrough|side-lane)'; then
+          if git diff origin/master...HEAD -- src/server.ts | grep -Eq "^[+-].*($LANE_SYMBOLS)"; then
             LANE_DIFF="${LANE_DIFF:+$LANE_DIFF, }src/server.ts (lane symbols)"
+          fi
+          if git diff origin/master...HEAD -- src/server/handle.ts | grep -Eq "^[+-].*($LANE_SYMBOLS)"; then
+            LANE_DIFF="${LANE_DIFF:+$LANE_DIFF, }src/server/handle.ts (lane symbols)"
           fi
           if [[ -z "$LANE_DIFF" ]]; then
             echo "✓ no side-lane logic changes"

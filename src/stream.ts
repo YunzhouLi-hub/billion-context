@@ -417,7 +417,7 @@ export function summaryFingerprintLine(blockId: string, summary: string): string
     // family, third site; never slice model-visible text by hand again).
     const head = scrubLoneSurrogates(safePrefix(summary, 30).replace(/\r?\n/g, " "));
     const tail = scrubLoneSurrogates(safeSuffix(summary, 100).replace(/\r?\n/g, " "));
-    return ` · ${blockId} summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
+    return ` · ${blockId} full summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
 }
 
 // #1718: log-safe variant of the fingerprint line. Summaries are
@@ -896,6 +896,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                 msg += note;
                 logMsg += note;
             }
+        }
+        // #2544: the fingerprint's head/tail excerpts read as "only the ends
+        // were stored", and models have answered that reading by defensively
+        // decompressing freshly created blocks to recover the "missing"
+        // middle. State the opposite at the moment the suspicion arises and
+        // route detail retrieval through search_context first, matching the
+        // kernel's "use search_context BEFORE decompressing" guidance.
+        // Model-facing receipt only — the log copy carries no excerpts by
+        // design (#1718), so it keeps neither the fingerprints nor this note.
+        if (changedBlocks.length > 0) {
+            msg += "\nFingerprints show head/tail only — every summary is stored in full. To retrieve a specific detail from a new block, call search_context({ query }) first; decompress only if the excerpt doesn't answer it.";
         }
         // #189 staged compression (gated): a rewrite above the configured max
         // shrink is the shape that trips provider risk-control; steer the model

@@ -26,6 +26,7 @@ import { applyImageCompressionPass, imageFullTrailingNote, imageUsageSuffix } fr
 import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
@@ -329,6 +330,7 @@ export async function forward(
                     fs.writeFileSync(out, wireText);
                 }
                 log("info", `[debug] forwarded body written to ${out}`);
+                gcDumpDirIfConfigured(dumpDir);
             }
         } catch { /* best-effort */ }
     }
@@ -373,6 +375,7 @@ export async function forward(
             const reqPath = `${rawBase}-REQ.txt`;
             fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
+            gcDumpDirIfConfigured(path.dirname(rawBase));
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
@@ -793,6 +796,7 @@ export async function forward(
             const resPath = `${rawBase}-RES.txt`;
             fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
             log("info", `[debug] RAW response dump: ${resPath}`);
+            gcDumpDirIfConfigured(path.dirname(rawBase));
         } catch (err) { logDumpFailure("RES dump", err); }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too

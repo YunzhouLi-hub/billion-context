@@ -3,6 +3,7 @@ import path from "node:path";
 import { dumpsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { dump4xxEnabled as knobDump4xxEnabled, dump4xxMaxBytes as knobDump4xxMaxBytes } from "./knobs.js";
+import { gcDumpDirIfConfigured } from "./state-gc.js";
 
 // #762: when the upstream rejects the forwarded body (4xx), persist the exact
 // bytes that were sent so the rejection can be explained byte-for-byte. The
@@ -49,6 +50,7 @@ export function dumpRejectedBody(status: number, sessionId: string, body: string
         const out = path.join(dir, `err-${Date.now()}-${sid}-${status}.json`);
         fs.writeFileSync(out, `${text}${marker}`);
         loggerLog("info", `[dump] upstream ${status} rejected body written to ${out}`);
+        gcDumpDirIfConfigured(dir);
         return out;
     } catch (err) {
         warnDumpFailure(err);
@@ -80,6 +82,7 @@ export function dumpSummaryRejection(status: number, sessionId: string, request:
         const out = path.join(dir, `summary-err-${Date.now()}-${sid}-${status}.json`);
         fs.writeFileSync(out, JSON.stringify({ status, request: side(request), response: side(response) }, null, 2));
         loggerLog("info", `[dump] upstream ${status} rejected summary exchange written to ${out}`);
+        gcDumpDirIfConfigured(dir);
         return out;
     } catch (err) {
         warnDumpFailure(err);
