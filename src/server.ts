@@ -2396,7 +2396,7 @@ export async function preflightCompressIfNeeded(
     const autoFoldTarget = autoFoldOn
         ? Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget))
         : undefined;
-    const growthArmed = autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget;
+    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget) — keep in sync (PR #2581 review)
     const compressionTarget = growthArmed ? autoFoldTarget : overflowTarget;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
@@ -2799,9 +2799,13 @@ export async function preflightCompressIfNeeded(
         // could not deliver at all. Arm the cooldown right here (the arm branch
         // below is unreachable from this path — it sits after this return) so
         // classic nudges resume instead of re-attempting the dead chain every
-        // turn.
-        if (growthArmed && payloadFitsWindow) {
-            log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (payload fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
+        // turn. The arm is deliberately NOT gated on the calibrated payload:
+        // a calibration straddle (estimate < limit <= calibrated) used to skip
+        // it, re-firing the trigger every turn with a guaranteed-400 forward
+        // and no recovery (PR #2581 review) — now the straddle arms too, and
+        // the forwarded request's 400 arms overflow-shrink with real evidence.
+        if (growthArmed) {
+            log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
             armAutoFoldBackoff(session);
             markDirty(session);
         } else {

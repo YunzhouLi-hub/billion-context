@@ -1178,3 +1178,97 @@ test("#1957 a stale in-flight verdict cannot clobber a healthy same-origin repla
     assert.equal(await first, origin);
     assert.equal(await second, origin, "caller 2 recovers through the shared ready");
 });
+
+// #2496 guard (PR #2581 review): a Request-object input whose body was
+// DISTURBED by a failed send (the underlying fetch consumed it before
+// throwing) is unrecoverable — `new Request(target, input)` on a used body
+// throws a confusing "Body is unusable", and a retry/degrade would at best
+// send garbage. The wrapper must surface the ORIGINAL failure instead of
+// retrying, respawning, or degrading to a direct send.
+test("install: routed /bili/ Request with a disturbed body fails with the original error — no retry, no respawn, no give-up (#2496)", async () => {
+    const calls: string[] = [];
+    const bodies: string[] = [];
+    const dispatches: string[] = [];
+    const saved = globalThis.fetch;
+    _resetForTest();
+    let failures = 0;
+    let disturb = true; // phase 1 disturbs the body before failing; phase 2 fails clean
+    globalThis.fetch = (async (input: string | URL | Request) => {
+        const req = input instanceof Request ? input : undefined;
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
+        calls.push(url);
+        if (req !== undefined) {
+            // Record the body BEFORE deciding the outcome (clone-then-read
+            // keeps the original stream untouched for a potential retry).
+            bodies.push(await req.clone().text());
+        }
+        if (url.startsWith("http://127.0.0.1:40001/") && failures < 1) {
+            failures += 1;
+            if (req !== undefined && disturb) {
+                // Disturb the body — consume it, then fail. The wrapper's
+                // retry path (`new Request(target, input)`) can no longer
+                // rebuild a sendable request from this input.
+                await req.text();
+            }
+            throw new TypeError("fetch failed");
+        }
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    let respawns = 0;
+    let giveUps = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        attach: true,
+        respawn: () => {
+            respawns += 1;
+            state.origin = "http://127.0.0.1:40001";
+            state.ready = Promise.resolve("http://127.0.0.1:40001");
+            return Promise.resolve("http://127.0.0.1:40001");
+        },
+        onGiveUp: () => {
+            giveUps += 1;
+        },
+        onDispatch: (_url, action) => dispatches.push(action),
+    };
+    const payload = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hello" }] });
+    try {
+        assert.equal(installNativeFetchIntercept(state), true);
+        // Phase 1: disturbed body — the original failure must bubble out.
+        const disturbed = new Request("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: payload,
+        });
+        await assert.rejects(
+            globalThis.fetch(disturbed),
+            (err: unknown) => err instanceof TypeError && err.message === "fetch failed",
+            "the original 'fetch failed' must surface — not a confusing 'Body is unusable'",
+        );
+        assert.equal(calls.length, 1, "no retry may be attempted on a disturbed body");
+        assert.deepEqual(dispatches, ["self"]);
+        assert.equal(respawns, 0, "a disturbed body is not a proxy death — no respawn");
+        assert.equal(giveUps, 0, "no give-up side effects");
+
+        // Phase 2: UN-disturbed Request body — the same blip retries and the
+        // forwarded body is byte-identical to what the caller handed in.
+        failures = 0; // re-arm the one-shot failure for the second phase
+        disturb = false; // phase 2 fails WITHOUT disturbing the body
+        const intact = new Request("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: payload,
+        });
+        const res = await globalThis.fetch(intact);
+        assert.equal(res.status, 200, "intact body retries normally");
+        assert.deepEqual(dispatches, ["self", "self", "retry"]);
+        assert.equal(respawns, 1);
+        assert.equal(giveUps, 0);
+        assert.equal(bodies.length, 3);
+        assert.equal(bodies[0], payload, "first attempt carried the caller's body");
+        assert.equal(bodies[2], payload, "retry carried the SAME body bytes — no empty/garbled re-send");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+});

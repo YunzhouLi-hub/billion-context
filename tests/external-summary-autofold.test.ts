@@ -318,3 +318,154 @@ test("auto-fold backoff: a failed growth fold arms a cooldown — the next turn 
     const text2 = JSON.stringify(forwarded2);
     assert.ok(text2.includes("final question"), "backed-off turn kept the conversation tail");
 });
+
+// ---------------------------------------------------------------------------
+// growthFoldingArmed unit truth table (#2581 review fix #1)
+// ---------------------------------------------------------------------------
+test("growthFoldingArmed: only suppress classic nudges when growth folding can actually fire", async () => {
+    const { growthFoldingArmed } = await import("../src/external-summary-surface.ts");
+    const chain = (autoFold: boolean, target?: number) => ({
+        externalSummary: { enabled: true, targets: ["sum/sm"], autoFold, ...(target !== undefined ? { autoFoldTargetTokens: target } : {}) },
+        modelContextLimit: 50_000,
+    });
+    // sanity: the import resolved to a function
+    assert.equal(typeof growthFoldingArmed, "function");
+    // disabled chain / autoFold off / garbage config → false (never suppress)
+    assert.equal(growthFoldingArmed(undefined), false);
+    assert.equal(growthFoldingArmed({ modelContextLimit: 50_000 }), false);
+    assert.equal(growthFoldingArmed(chain(false)), false);
+    assert.equal(growthFoldingArmed({ garbage: true }), false);
+    // no overflow resolvable (no window anywhere) → false
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true } }), false);
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true }, modelContextLimit: 0 }), false);
+    // healthy window: implicit (half) and explicit targets arm
+    assert.equal(growthFoldingArmed(chain(true)), true, "implicit round(overflow/2) target < window arms");
+    assert.equal(growthFoldingArmed(chain(true, 8192)), true, "explicit 8192 target on 50K window arms");
+    // degenerate: sub-MIN window clamps target up to the overflow → NOT armed
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true }, modelContextLimit: 8192 }), false, "implicit target on 8192 window clamps to the window itself");
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true, autoFoldTargetTokens: 10_000 }, modelContextLimit: 8192 }), false, "explicit target clamped to the window → not armed");
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true, autoFoldTargetTokens: 50_000 }, modelContextLimit: 50_000 }), false, "target === window is a no-op → not armed");
+    // codex lane bar: overflowTarget override is honored
+    assert.equal(growthFoldingArmed(chain(true), 45_000), true, "0.9x codex bar on 50K window still leaves room");
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true }, modelContextLimit: 20_000 }, 20_000), true, "bar with headroom above AUTO_FOLD_TARGET_MIN arms");
+    assert.equal(growthFoldingArmed({ externalSummary: { enabled: true, autoFold: true }, modelContextLimit: 10_000 }, 8192), false, "bar exactly at AUTO_FOLD_TARGET_MIN clamps the implicit target up to the bar — not armed");
+    assert.equal(growthFoldingArmed(chain(true, 4600), 4600), false, "explicit target clamped to at least MIN above the bar is a no-op");
+});
+
+// ---------------------------------------------------------------------------
+// e2e: degenerate growth configs must NOT suppress classic nudges (#2581 fix #1)
+// ---------------------------------------------------------------------------
+/** Main upstream that bills a flat token count (for tiny-window pressure bands). */
+function startBilledUpstream(bill: number): Promise<{ server: http.Server; url: string; bodies: unknown[] }> {
+    return new Promise((resolve) => {
+        const bodies: unknown[] = [];
+        const server = http.createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on("data", (c) => chunks.push(c));
+            req.on("end", () => {
+                try { bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { /* ignore */ }
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.write(`event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":${bill}}}}\n\n`);
+                res.write(`event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n`);
+                res.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+                res.end();
+            });
+        });
+        server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, bodies }));
+    });
+}
+
+test("degenerate sub-MIN growth window: classic nudges still fire (no silent suppression)", async () => {
+    // window 8192 == AUTO_FOLD_TARGET_MIN: the implicit round(window/2) target
+    // clamps up to the window itself, growth folding can never engage, and the
+    // old `!autoFoldEngaged(...)` suppression used to eat every classic nudge.
+    const main = await startBilledUpstream(7000); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 8192 } } } },
+        modelContextLimit: 8192,
+        kernelConfig: defaultConfig(8192, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    const warm = await postTurn(port, "deg-win", 2);
+    assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
+    const turn = await postTurn(port, "deg-win", 2);
+    assert.equal(turn.status, 200, "turn 2 must forward cleanly");
+    assert.equal(sum.bodies.length, 0, "growth folding never engaged (degenerate window) — no external calls");
+    const text = JSON.stringify(main.bodies.at(-1));
+    assert.ok(text.includes("Context breakdown:"), "classic nudge must fire when growth folding is degenerate (suppression bug)");
+});
+
+test("explicit autoFoldTargetTokens clamped to the window: classic nudges still fire", async () => {
+    // 50K window with autoFoldTargetTokens=50_000: target==window is a no-op
+    // growth config; it must not suppress the classic nudge either.
+    const main = await startMainUpstream(); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true, autoFoldTargetTokens: 50_000 },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: true,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    const warm = await postTurn(port, "deg-target", 36);
+    assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
+    const turn = await postTurn(port, "deg-target", 36);
+    assert.equal(turn.status, 200, "turn 2 must forward cleanly");
+    assert.equal(sum.bodies.length, 0, "clamped target is a no-op growth config — no external calls");
+    const text = JSON.stringify(main.bodies.at(-1));
+    assert.ok(text.includes("Context breakdown:"), "classic nudge must fire when the explicit target clamps to the window");
+});

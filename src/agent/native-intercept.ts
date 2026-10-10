@@ -604,6 +604,14 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 // proxy death — send() already exhausted every live anchor;
                 // respawning would churn a healthy proxy for the wrong fault.
                 if (!(err instanceof TypeError) || isDeadClosureError(err)) throw err;
+                // #2496 guard: a Request-object body disturbed by the failed
+                // send cannot be re-sent — `new Request(target, input)` would
+                // throw a confusing "Body is unusable" (or, for some stream
+                // bodies, silently send an empty/EOF body). The request is
+                // unrecoverable either way: surface the original failure
+                // instead of retrying or degrading to a direct send (PR #2581
+                // review).
+                if (input instanceof Request && input.bodyUsed) throw err;
                 const deadOrigin = new URL(target).origin;
                 const again = await recover(deadOrigin);
                 if (again !== undefined) {

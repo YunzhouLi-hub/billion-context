@@ -112,6 +112,24 @@ function parseBudget(raw: unknown): SummaryBudget {
     return { totalTimeoutMs, targetTimeoutMs, maxSummaryBytes };
 }
 
+const seenAutoFoldInertWarnings = new Set<string>();
+
+/** [#autoFold] Surface the silent no-op: `autoFold`/`autoFoldTargetTokens` are
+ *  read only once the chain is enabled (parseAutoFold runs after the enabled
+ *  gate), so setting them on a disabled — or omitted-`enabled` — chain does
+ *  nothing. Warn once per distinct knob-set instead of failing silently; purely
+ *  diagnostic, changes no behavior. */
+function noteAutoFoldIgnored(settings: Record<string, unknown>): void {
+    const wantsAutoFold = settings.autoFold === true;
+    const hasTarget = settings.autoFoldTargetTokens !== undefined;
+    if (!wantsAutoFold && !hasTarget) return;
+    const sig = `${wantsAutoFold ? "f" : "-"}:${hasTarget ? "t" : "-"}`;
+    if (seenAutoFoldInertWarnings.has(sig)) return;
+    seenAutoFoldInertWarnings.add(sig);
+    const knobs = `${wantsAutoFold ? "autoFold" : ""}${wantsAutoFold && hasTarget ? " + " : ""}${hasTarget ? "autoFoldTargetTokens" : ""}`;
+    loggerLog("warn", `[external-summary] ${knobs} set but "enabled" is not true — the chain is off, so it has no effect. Set "enabled": true to activate auto-fold.`);
+}
+
 /** External summary chain, three-level like every other `compress` field:
  *  a deeper level (provider or model) replaces the whole chain — no per-target
  *  or per-budget sub-merge. Syntax level only: references are validated
@@ -122,6 +140,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
+        noteAutoFoldIgnored(settings);
         // A disabled chain never reads targets or budget — rejecting the
         // whole compress block over a stale typo here would disable
         // compression itself. Strict validation re-engages the moment the
@@ -208,6 +227,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
+        noteAutoFoldIgnored(settings);
         return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET };
     }
     if (settings.targets !== undefined && !Array.isArray(settings.targets)) throw new Error("External summary targets must be an array");

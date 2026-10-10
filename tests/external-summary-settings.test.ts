@@ -11,6 +11,7 @@ import { applyCompressSettings, mergeCompress } from "../src/compress-settings.t
 import { collectNamedProviders, parseCompressSettings, parseNamedProviderRecipe, parseRouteEntry, type NamedProviderRecipe } from "../src/config.ts";
 import { defaultConfig } from "acp-kernel";
 import { handleConfigGet, handleConfigPut, handleSummaryCredentialPut } from "../src/web/api.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const recipes: Record<string, NamedProviderRecipe> = {
@@ -314,4 +315,27 @@ test("autoFold validation: boolean only, target within [8192, 10M]", () => {
     const off = parseExternalSummaryChain({ enabled: false, targets: [], autoFold: "junk" as unknown as boolean });
     assert.equal(off.enabled, false);
     assert.equal(off.autoFold, undefined);
+});
+
+test("autoFold set on a disabled chain warns instead of silently no-oping", () => {
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
+    try {
+        // `enabled` omitted entirely → chain is off; autoFold must surface, not vanish.
+        const off = parseExternalSummaryChain({ autoFold: true });
+        assert.equal(off.enabled, false);
+        assert.ok(warns.some((w) => w.includes("autoFold") && w.includes('"enabled"')), "expected an autoFold-inert warning");
+        // Explicitly disabled with both knobs → still off, still surfaced, no crash.
+        const offBoth = parseExternalSummaryChain({ enabled: false, autoFold: true, autoFoldTargetTokens: 16384 });
+        assert.equal(offBoth.enabled, false);
+        assert.equal(offBoth.autoFold, undefined);
+        // A correctly-enabled chain emits nothing on this front.
+        const before = warns.length;
+        const on = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], autoFold: true });
+        assert.equal(on.enabled, true);
+        assert.equal(on.autoFold, true);
+        assert.equal(warns.length, before);
+    } finally {
+        setLogCapture(null);
+    }
 });
