@@ -1863,10 +1863,9 @@ export async function handle(
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide)
                           : responsesCompact
-                            // #618 review nit: when no bili compaction item is present,
-                            // prepareResponsesCompact falls back to the raw bodyBuffer — forward
-                            // the re-serialized post-strip work instead so dropped images don't
-                            // ride along. Unchanged bodies keep the original buffer byte-identical.
+                            // #618: when no bili compaction item is present,
+                            // prepareResponsesCompact falls back to the raw bodyBuffer —
+                            // forward it unchanged (byte-identical passthrough).
                             ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
                             : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
                 };
