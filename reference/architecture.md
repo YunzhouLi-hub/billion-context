@@ -41,6 +41,7 @@ billion-context/
 │   ├── conflict-watch.ts         # Per-session compression-conflict ledger (#1206)
 │   ├── upstream-proxy.ts         # undici ProxyAgent routing (explicit-direct vs no-preference, SOCKS reject)
 │   ├── fetch-util.ts             # Capped body reads, timeout/replay helpers (knob-resolved)
+│   ├── request-body-budget.ts   # 接收、解压、发送字节预算与大请求名额
 │   ├── fetch-transport.ts        # AsyncLocalStorage fetch-transport override (withFetchTransport)
 │   ├── content-encoding.ts       # gzip/deflate decode + decompression-bomb guard (413)
 │   ├── wire-body.ts              # Trailing-user-turn append on assembled wire bodies
