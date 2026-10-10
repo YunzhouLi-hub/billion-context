@@ -136,12 +136,19 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
     "google-generative-ai": "google",
 };
 
+// #2585: mirrors the server-side scheme rule (src/agent-providers.ts) — a
+// plain-HTTP non-loopback baseUrl would be refused there (the resolved apiKey
+// must not travel over plaintext), so pre-skip it and name the skip locally.
+// Keep in lockstep with the server's loopback list.
+const AGENT_PROVIDER_LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
 /** #2336: report the host's own provider dialing recipes — baseUrl + api +
  *  the RESOLVED api key, in memory only — so summary chains can reference
  *  them ("glm/glm-5") without duplicating the dialing config in bili's
  *  file. Skips OAuth providers, auth.json credentials ("stored" — never
- *  collected by design), unmappable apis and baseUrls that point back at
- *  this proxy. Returns true when done (or permanently unavailable) so the
+ *  collected by design), unmappable apis, baseUrls that point back at this
+ *  proxy, and plain-HTTP non-loopback baseUrls (#2585 — the server would
+ *  refuse them). Returns true when done (or permanently unavailable) so the
  *  caller can stop retrying; throws on transient failures. */
 export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
     const proxyBase = proxyBaseForCtx(ctx);
@@ -180,7 +187,17 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         // testing detectProxyBase() !== undefined (which would skip the
         // whole table whenever BILLION_CONTEXT_PROXY is set).
         let selfLoop = true;
-        try { selfLoop = new URL(baseUrl).origin === new URL(proxyBase).origin; } catch { selfLoop = true; }
+        try {
+            const u = new URL(baseUrl);
+            // #2585: plain-HTTP non-loopback would be refused server-side (key
+            // over plaintext) — pre-skip and say so. No url in the warn: a
+            // baseUrl may carry inline credentials.
+            if (u.protocol === "http:" && !AGENT_PROVIDER_LOOPBACK_HOSTS.includes(u.hostname)) {
+                console.warn(`bili-plugin(${agent}): agent-providers: provider "${id}" not reported — plain-HTTP non-loopback baseUrl (bili refuses to register it, its apiKey would travel over plaintext) (#2585)`);
+                continue;
+            }
+            selfLoop = u.origin === new URL(proxyBase).origin;
+        } catch { selfLoop = true; }
         if (selfLoop) continue;
         const status = registry.getProviderAuthStatus(id);
         if (status?.configured !== true || status.source === "stored") continue;
@@ -208,7 +225,20 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         body: JSON.stringify({ agent, providers }),
         signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) throw new Error(`agent-providers HTTP ${res.status}`);
+    let body: { error?: unknown; skipped?: unknown };
+    try { body = JSON.parse(await res.text()); } catch { body = {}; }
+    if (!res.ok) {
+        // #2585: the response body names what was refused — surface it, don't
+        // leave the user with a bare status code.
+        const detail = typeof body.error === "string" && body.error.length > 0 ? body.error.slice(0, 300) : "";
+        throw new Error(detail.length > 0 ? `agent-providers HTTP ${res.status}: ${detail}` : `agent-providers HTTP ${res.status}`);
+    }
+    for (const s of Array.isArray(body.skipped) ? body.skipped : []) {
+        const item = s as { name?: unknown; reason?: unknown };
+        if (typeof item.name === "string" && typeof item.reason === "string") {
+            console.warn(`bili-plugin(${agent}): agent-providers: provider "${item.name}" not registered by bili: ${item.reason} — bili-side references to it stay unresolved (#2585)`);
+        }
+    }
     return true;
 }
 

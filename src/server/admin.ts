@@ -14,7 +14,7 @@ import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
 import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
-import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes } from "../agent-providers.js";
+import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
 import { BodyTooLargeError, headerValue, readBody, selfAdminProbePath } from "../server.js";
@@ -373,17 +373,23 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // #2336 agent-registry fallback: a plugin host reports its dialing
         // recipes (key bytes resolved in the agent's memory). Names only in
         // the response — the key never crosses a log or GET surface.
+        // #2585: intake is per-entry — a refused entry is logged and named in
+        // the response instead of discarding the whole report.
         try {
             const body = await readBody(req);
             const report = parseAgentProviderReport(JSON.parse(body.toString("utf8")));
-            recordAgentProviders(report.agent, report.providers);
-            log("info", `[agent-providers] ${report.agent} registered: ${Object.keys(report.providers).sort().join(", ")} (#2336)`);
+            recordAgentProviders(report.agent, report.registered);
+            const names = Object.keys(report.registered).sort();
+            log("info", `[agent-providers] ${report.agent} registered: ${names.join(", ") || "(none)"} (#2336)`);
+            for (const s of report.skipped) log("warn", `[agent-providers] ${report.agent} skipped ${s.name}: ${s.reason} (this provider stays unresolved) (#2585)`);
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, agent: report.agent, providers: Object.keys(report.providers) }));
+            res.end(JSON.stringify({ ok: true, agent: report.agent, registered: names, skipped: report.skipped }));
             return;
         } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log("warn", `[agent-providers] report rejected: ${sanitizeAgentProviderField(msg, 200)} (#2585)`);
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+            res.end(JSON.stringify({ ok: false, error: msg }));
             return;
         }
     }
