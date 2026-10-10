@@ -20,7 +20,7 @@ import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 // ---------- helper unit tests ----------
 
 const CC_COMPACTION_PROMPT =
-    "Summarize the conversation so far. Your summary should be约 8-29 sentences. \nWrap your summary in <summary></summary> tags.\nREMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block.";
+    "Summarize the conversation so far. Your summary should be about 8-29 sentences. \nWrap your summary in <summary></summary> tags.\nREMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block.";
 
 test("requestExpectsProseSummary: Claude Code compaction phrasing is detected", () => {
     assert.equal(requestExpectsProseSummary(CC_COMPACTION_PROMPT), true);
