@@ -141,7 +141,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         assert.equal(plan.byTool, 0, "rewritten toolCallId scheme defeats the tool pass — positional did the work");
         assert.equal(plan.byNorm, 0, "changed contentType literal defeats the norm pass — positional did the work");
         assert.equal(plan.unmatched.length, 0);
-        for (let i = 0; i < 10; i++) assert.equal(plan.claims.get(`old_${i}`), `new_${i}`);
+        for (let i = 0; i < 10; i++) assert.deepEqual(plan.claims.get(`old_${i}`), [`new_${i}`]);
     });
 
     test("without the stored copy the same churn falls to the old heuristics (and the pass rebuilds the copy)", () => {
@@ -173,8 +173,8 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         assert.equal(plan.byPos, 9);
         assert.equal(plan.unmatched.length, 1);
         assert.equal(plan.unmatched[0], "old_5");
-        assert.equal(plan.claims.get("old_0"), "new_0");
-        assert.equal(plan.claims.get("old_9"), "new_9");
+        assert.deepEqual(plan.claims.get("old_0"), ["new_0"]);
+        assert.deepEqual(plan.claims.get("old_9"), ["new_9"]);
         assert.equal(plan.claims.get("old_5"), undefined);
     });
 
@@ -186,8 +186,8 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const { plan } = planFor(old, next, pos);
         assert.equal(plan.byPos, 10);
         assert.equal(plan.unmatched.length, 0);
-        assert.equal(plan.claims.get("old_4"), "new_4");
-        assert.equal(plan.claims.get("old_5"), "new_5");
+        assert.deepEqual(plan.claims.get("old_4"), ["new_4"]);
+        assert.deepEqual(plan.claims.get("old_5"), ["new_5"]);
     });
 
     test("deleting one of two identical messages leaves exactly one unmatched", () => {
@@ -204,7 +204,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         assert.equal(plan.unmatched.length, 1, "the deleted twin is honestly unmatched");
         assert.equal(plan.claims.size, 9);
         // the surviving twin is claimed onto the identical-content survivor
-        assert.ok(plan.claims.get("dup_a") === "new_4" || plan.claims.get("dup_b") === "new_4");
+        assert.ok(plan.claims.get("dup_a")?.[0] === "new_4" || plan.claims.get("dup_b")?.[0] === "new_4");
     });
 
     test("client-native compaction + codec switch: tail keeps coverage, head is honestly lost", () => {
@@ -221,7 +221,7 @@ describe("planReconciliation Pass 0 (#2480)", () => {
         const { plan } = planFor(old, compacted, pos);
         // head scan stops at the summary; tail scan claims the 6 survivors
         assert.equal(plan.byPos, 6);
-        for (let i = 6; i < 12; i++) assert.equal(plan.claims.get(`old_${i}`), `new_${i - 6}`);
+        for (let i = 6; i < 12; i++) assert.deepEqual(plan.claims.get(`old_${i}`), [`new_${i - 6}`]);
         // the compacted-away head is honestly unmatched — no death spiral claim
         const headUnmatched = plan.unmatched.filter((id) => Number(id.slice(4)) < 6);
         assert.equal(headUnmatched.length, 6);
