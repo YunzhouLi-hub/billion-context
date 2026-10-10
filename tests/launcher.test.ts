@@ -3980,7 +3980,9 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         // client scanner attach the browser half), not the legacy file URL;
         // NODE_PATH points the scanner's CJS resolution at the base home.
         assert.ok(/- id: bili-native\n {6}name: billion-context\n/.test(patchTxt));
-        assert.match(patchTxt, /^- id: compaction-basic\n  config:\n    auto: false\n$/m);
+        assert.match(patchTxt, /^- id: compaction-basic\n  config:\n    auto: false\n/m);
+        assert.match(patchTxt, /^- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n/m);
+        assert.match(patchTxt, /^- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n$/m);
         assert.ok(String(seenEnv.NODE_PATH ?? "").startsWith(path.join(dshHome, "node_modules")), `NODE_PATH seeds the scanner: ${seenEnv.NODE_PATH}`);
         assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
         rmrf(overlay);
