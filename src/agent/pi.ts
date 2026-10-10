@@ -136,12 +136,19 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
     "google-generative-ai": "google",
 };
 
+// #2585: mirrors the server-side scheme rule (src/agent-providers.ts) — a
+// plain-HTTP non-loopback baseUrl would be refused there (the resolved apiKey
+// must not travel over plaintext), so pre-skip it and name the skip locally.
+// Keep in lockstep with the server's loopback list.
+const AGENT_PROVIDER_LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
 /** #2336: report the host's own provider dialing recipes — baseUrl + api +
  *  the RESOLVED api key, in memory only — so summary chains can reference
  *  them ("glm/glm-5") without duplicating the dialing config in bili's
  *  file. Skips OAuth providers, auth.json credentials ("stored" — never
- *  collected by design), unmappable apis and baseUrls that point back at
- *  this proxy. Returns true when done (or permanently unavailable) so the
+ *  collected by design), unmappable apis, baseUrls that point back at this
+ *  proxy, and plain-HTTP non-loopback baseUrls (#2585 — the server would
+ *  refuse them). Returns true when done (or permanently unavailable) so the
  *  caller can stop retrying; throws on transient failures. */
 export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boolean> {
     const proxyBase = proxyBaseForCtx(ctx);
@@ -180,7 +187,17 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         // testing detectProxyBase() !== undefined (which would skip the
         // whole table whenever BILLION_CONTEXT_PROXY is set).
         let selfLoop = true;
-        try { selfLoop = new URL(baseUrl).origin === new URL(proxyBase).origin; } catch { selfLoop = true; }
+        try {
+            const u = new URL(baseUrl);
+            // #2585: plain-HTTP non-loopback would be refused server-side (key
+            // over plaintext) — pre-skip and say so. No url in the warn: a
+            // baseUrl may carry inline credentials.
+            if (u.protocol === "http:" && !AGENT_PROVIDER_LOOPBACK_HOSTS.includes(u.hostname)) {
+                console.warn(`bili-plugin(${agent}): agent-providers: provider "${id}" not reported — plain-HTTP non-loopback baseUrl (bili refuses to register it, its apiKey would travel over plaintext) (#2585)`);
+                continue;
+            }
+            selfLoop = u.origin === new URL(proxyBase).origin;
+        } catch { selfLoop = true; }
         if (selfLoop) continue;
         const status = registry.getProviderAuthStatus(id);
         if (status?.configured !== true || status.source === "stored") continue;
@@ -208,7 +225,20 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         body: JSON.stringify({ agent, providers }),
         signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) throw new Error(`agent-providers HTTP ${res.status}`);
+    let body: { error?: unknown; skipped?: unknown };
+    try { body = JSON.parse(await res.text()); } catch { body = {}; }
+    if (!res.ok) {
+        // #2585: the response body names what was refused — surface it, don't
+        // leave the user with a bare status code.
+        const detail = typeof body.error === "string" && body.error.length > 0 ? body.error.slice(0, 300) : "";
+        throw new Error(detail.length > 0 ? `agent-providers HTTP ${res.status}: ${detail}` : `agent-providers HTTP ${res.status}`);
+    }
+    for (const s of Array.isArray(body.skipped) ? body.skipped : []) {
+        const item = s as { name?: unknown; reason?: unknown };
+        if (typeof item.name === "string" && typeof item.reason === "string") {
+            console.warn(`bili-plugin(${agent}): agent-providers: provider "${item.name}" not registered by bili: ${item.reason} — bili-side references to it stay unresolved (#2585)`);
+        }
+    }
     return true;
 }
 
@@ -316,6 +346,36 @@ export function parentConversationIdOf(ctx: Ctx): string | undefined {
         // unreadable parent or missing getHeader — no derivation to report
     }
     return undefined;
+}
+
+// #2469: parentSession proves LINEAGE, not seeding. Pi's session header has
+// no seed marker, but the evidence sits in the child's own branch: fork()
+// copies the parent's entries verbatim, and pi persists the turn's user
+// message BEFORE its first provider request (runAgentLoop emits the prompt
+// messages' message_end — session-manager.appendMessage — ahead of the
+// stream's onPayload hook), so a seeded child's branch already holds
+// parent-length + 1 messages at first request, while a spawned subagent
+// (newSession({parentSession}), inherit_context off) holds only its own task
+// prompt. Counting the branch's conversation messages distinguishes the two
+// at zero network cost; hosts without getBranch (or where it throws) yield
+// undefined and keep today's always-attempt behavior (fail toward capability).
+// The hash prefix match inside tryForkAdoption stays the final gate either
+// way (#2394 opencode-lane contract), so a misclassified attempt only costs
+// one snapshot GET.
+export const FORK_SEED_MIN_REPLAYED_MESSAGES = 2;
+
+export function replayedMessageCount(ctx: Ctx): number | undefined {
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return undefined;
+        let count = 0;
+        for (const entry of branch) {
+            if (entry !== null && typeof entry === "object" && (entry as { type?: unknown }).type === "message") count += 1;
+        }
+        return count;
+    } catch {
+        return undefined;
+    }
 }
 
 // omp's chat-completions payloads carry NO conversation signal (no
@@ -1019,6 +1079,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // on every model request.
         const forkAdopter = createForkAdopter((line) => console.error(`bili-plugin(${agent}): ${line}`));
         const forkParents = new Map<string, string | undefined>();
+        const forkSeedVerdicts = new Map<string, "seeded" | "lineage-only" | "unknown">();
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
             const sid = sessionIdOf(ctx);
@@ -1026,6 +1087,21 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (!forkParents.has(sid)) forkParents.set(sid, parentConversationIdOf(ctx));
             const parent = forkParents.get(sid);
             if (parent === undefined || parent === "" || parent === sid) return;
+            // #2469: seeding evidence is evaluated ONCE per sid — the first
+            // model request IS the adoption window (later requests can only
+            // CHILD_CONFLICT), so a lineage-only verdict can never lose a
+            // later adoption opportunity. Lineage-only children skip every
+            // network call; their derivedFrom link (registerTools) stays
+            // read-only.
+            if (!forkSeedVerdicts.has(sid)) {
+                const count = replayedMessageCount(ctx);
+                const verdict = count === undefined ? "unknown" : count >= FORK_SEED_MIN_REPLAYED_MESSAGES ? "seeded" : "lineage-only";
+                forkSeedVerdicts.set(sid, verdict);
+                if (verdict === "lineage-only") {
+                    console.warn(`bili-plugin(${agent}): fork adoption for ${sid} skipped — lineage-only child (${count} message(s) in its own branch, no replayed parent history); the derivedFrom link stays read-only (#2469)`);
+                }
+            }
+            if (forkSeedVerdicts.get(sid) === "lineage-only") return;
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return;

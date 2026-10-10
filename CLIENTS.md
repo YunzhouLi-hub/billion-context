@@ -18,12 +18,19 @@ Two lanes, same plugin (#941):
   boots with the bili tools registered natively, model requests carry
   `x-bili-plugin` + the dsh session id (plugin mode), and `/acp` is
   session-bound. dsh's native auto-compaction is disabled in the same patch
-  (`compaction-basic` → `auto: false`); manual `/compact` stays available.
+  (`compaction-basic` → `auto: false`); manual `/compact` stays available. The
+  same patch also adds `MALFORMED_RESPONSE` to the built-in DeepSeek routes'
+  retry whitelist, so one sampling flake that breaks a tool-call argument JSON
+  retries instead of killing the turn (#2605).
 - **Profile install (no launcher) — one lane (#966):** `bili plugin install
   dsh` runs `dsh plugin --profile <name> add billion-context` for every
   existing profile — pnpm installs the package into each profile's own
   `node_modules`, and dsh mounts the bundled patch layer
-  (`dsh.bundle.patch.yml`) automatically. The spec follows how bili itself
+  (`dsh.bundle.patch.yml`) automatically — besides mounting `bili-native` and
+  disabling dsh's auto-compaction, it adds `MALFORMED_RESPONSE` to the built-in
+  DeepSeek routes' retry whitelist (#2605); the profile's own
+  `cordis.patch.yml` applies later, so a full `retryPolicy` written there
+  overrides it. The spec follows how bili itself
   was installed (#925): an npm-form install passes the registry name, a
   checkout/dev build passes its absolute path (a `link:` dependency, so
   local work stays live). Legacy managed blocks (`# bili begin` /
@@ -336,6 +343,18 @@ two small node scripts that do the work around the client:
   `BILI_PROVIDER_REWRITES` is defined. Opt-out: `BILI_NATIVE_ZCODE=0`.
 
 ## Codex (OpenAI Codex CLI)
+
+**Window alignment.** Client-reported plugin/runtime windows and launcher windows
+take precedence over the bundled Codex model table. Without a report, a local
+proxy reads `models_cache.json` and the base `config.toml` under its `CODEX_HOME`
+(default `~/.codex`); `model_context_window` is capped by the matching model's
+`max_context_window`, then reduced by `effective_context_window_percent` (Codex's
+default is 95). Cache changes are picked up on subsequent requests. Missing,
+unreadable or invalid metadata falls back to the bundled table and its existing
+272K unknown-model limit. For a remote proxy or a different client profile, pass
+the client's window through the existing launcher/runtime reporting mechanism
+or set the existing `compress.modelContextLimit`; the proxy's local cache is not
+evidence of another machine's configuration. Output headroom still applies.
 
 Codex is the one client a plugin install cannot make self-sufficient. The seam
 matrix explains why: claude has a `SessionStart` hook + managed settings block,

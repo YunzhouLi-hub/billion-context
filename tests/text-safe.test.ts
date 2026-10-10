@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { safePrefix, safeSuffix, scrubLoneSurrogates } from "../src/text-safe.js";
+import { safePrefix, safeSuffix, scrubLoneSurrogates, scrubLoneSurrogateEscapes, scrubLoneSurrogatesOnWire } from "../src/text-safe.js";
 import { saltedMsgIdForLog, summaryFingerprintLine, summaryFingerprintLogLine } from "../src/stream.js";
 
 const EMOJI = "\u{1F4E5}"; // D83D DCE5
@@ -66,7 +66,7 @@ test("#1615 repro B: fingerprint with tail cut on a low surrogate round-trips JS
 test("fingerprint: ASCII summaries are byte-identical to the pre-fix format", () => {
     const summary = "plain ascii summary with no emoji inside";
     const line = summaryFingerprintLine("b3", summary);
-    assert.equal(line, ` \u00b7 b3 summary ${summary.length}ch \u00b7 head "${summary.slice(0, 30)}" \u2026 tail "${summary.slice(-100)}"`);
+    assert.equal(line, ` \u00b7 b3 full summary ${summary.length}ch \u00b7 head "${summary.slice(0, 30)}" \u2026 tail "${summary.slice(-100)}"`);
 });
 
 test("fingerprint: emoji fully inside a window is preserved verbatim", () => {
@@ -97,6 +97,46 @@ test("#1718: saltedMsgIdForLog is deterministic, input-free, and salt-sensitive"
         saltedMsgIdForLog(id, "salt-B"),
         "different process salts break cross-run correlation",
     );
+});
+
+// #1615 wire half: by the time a body is serialized, a lone half is ASCII
+// escape text — scrubLoneSurrogates above sees no code unit and the strict
+// upstream parser still rejects the body. These pin the escape-text scanner.
+test("scrubLoneSurrogateEscapes: unpaired escape text becomes \\ufffd", () => {
+    assert.equal(scrubLoneSurrogateEscapes("A \\udcca B"), "A \\ufffd B"); // lone low
+    assert.equal(scrubLoneSurrogateEscapes("A \\ud83d B"), "A \\ufffd B"); // lone high
+    assert.equal(scrubLoneSurrogateEscapes("\\udcca"), "\\ufffd");
+});
+
+test("scrubLoneSurrogateEscapes: a well-formed escape pair survives verbatim", () => {
+    const pair = "\\ud83d\\udcca"; // 📊 as JSON escape text
+    assert.equal(scrubLoneSurrogateEscapes(`before ${pair} after`), `before ${pair} after`);
+});
+
+test("scrubLoneSurrogateEscapes: doubled backslashes are literal prose, not escapes", () => {
+    // JSON text "\\udcca" means the model wrote the six characters literally;
+    // an even-length backslash run starts no escape, so it must survive.
+    const prose = "\\\\udcca";
+    assert.equal(scrubLoneSurrogateEscapes(prose), prose);
+});
+
+test("scrubLoneSurrogateEscapes: ordinary escapes are untouched", () => {
+    const s = 'line\\n tab\\t quote\\" A=\\u0041 CJK=\\u4e2d e9=\\u00e9 null=\\u0000';
+    assert.equal(scrubLoneSurrogateEscapes(s), s);
+    assert.equal(scrubLoneSurrogateEscapes("no escapes at all"), "no escapes at all");
+    assert.equal(scrubLoneSurrogateEscapes("trailing backslash \\"), "trailing backslash \\");
+    assert.equal(scrubLoneSurrogateEscapes("short hex \\u12"), "short hex \\u12");
+});
+
+test("scrubLoneSurrogatesOnWire: a serialized poisoned body has no unpaired escape left", () => {
+    const poisoned = `panel one${JSON.parse('"\\udcca"')} ACP status ${JSON.parse('"\\ud83d\\udcca"')} end`;
+    const wire = JSON.stringify({ messages: [{ role: "user", content: poisoned }] });
+    assert.ok(wire.includes("\\udcca"), "precondition: the half is escape text on the wire");
+    const fixed = scrubLoneSurrogatesOnWire(wire);
+    const parsed = JSON.parse(fixed) as { messages: { content: string }[] };
+    assertNoLoneSurrogate(parsed.messages[0].content, "scrubbed wire body");
+    assert.ok(parsed.messages[0].content.includes("\u{1F4CA}"), "valid pair preserved");
+    assert.ok(parsed.messages[0].content.includes("\ufffd"), "lone half became U+FFFD");
 });
 
 // #816 → #828 → #1615: every recurrence was NEW hand-sliced text. Ratchet:

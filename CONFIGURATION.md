@@ -180,6 +180,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `diagnostics.rawDumpDir` | string | <state dir>/raw | ACP_RAW_DUMP_DIR | Directory for raw wire dumps. |
 | `diagnostics.dump4xx` | boolean | false | BILI_DUMP_4XX | Persist upstream 4xx responses to disk for post-mortem inspection. |
 | `diagnostics.dump4xxMaxBytes` | number | 2097152 (floor 1024) | BILI_DUMP_4XX_MAX_BYTES | Size cap for a single 4xx dump file. |
+| `diagnostics.maxTotalBytes` | number | unset (off) | BILI_DUMP_MAX_TOTAL_BYTES | Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412). |
+| `diagnostics.maxAgeDays` | number | unset (off) | BILI_DUMP_MAX_AGE_DAYS | Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default. |
 | `diagnostics.renderNone` | boolean | false | ACP_RENDER_NONE | Disable all ACP tag rendering (raw wire study mode). |
 | `diagnostics.noInjectTool` | boolean | false | ACP_NO_INJECT_TOOL | Stop injecting the acp_compress tool definition into requests. |
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | Stop appending the compression doctrine to system prompts. |
@@ -792,6 +794,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
     "rawDumpDir": null,                   // raw-dump location; null = <state dir>/raw
     "dump4xx": false,                     // capture rejected 4xx bodies
     "dump4xxMaxBytes": 2097152,
+    "maxTotalBytes": null,                // cap total dump-dir bytes; null = no cap (#2412)
+    "maxAgeDays": null,                   // delete dump files older than N days; null = off
     "renderNone": false,                  // stop injecting mNNNNN render tags
     "noInjectTool": false,                // suppress compress tool injection
     "noCompressPrompt": false,            // suppress compress prompt text
@@ -846,10 +850,10 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `diagnostics`
 
-- **Type:** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
-- **Default:** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
+- **Type:** `{ dumpBody?: boolean; dumpReq?: boolean; rawDumpDir?: string; dump4xx?: boolean; dump4xxMaxBytes?: number; maxTotalBytes?: number; maxAgeDays?: number; renderNone?: boolean; noInjectTool?: boolean; noCompressPrompt?: boolean; countTokensPassthrough?: boolean; compressProtocol?: "tools" | "text" }`
+- **Default:** `{ dumpBody: false, dumpReq: true, rawDumpDir: <state dir>/raw, dump4xx: false, dump4xxMaxBytes: 2097152, maxTotalBytes: null, maxAgeDays: null, renderNone: false, noInjectTool: false, noCompressPrompt: false, countTokensPassthrough: false, compressProtocol: "tools" }`
 - **Status:** ACTIVE
-- **Description:** Debug/diagnostic toggles that used to be env-only (`ACP_DUMP_BODY`, `ACP_DUMP_REQ`, `ACP_RAW_DUMP_DIR`, `BILI_DUMP_4XX`, `BILI_DUMP_4XX_MAX_BYTES`, `ACP_RENDER_NONE`, `ACP_NO_INJECT_TOOL`, `ACP_NO_COMPRESS_PROMPT`, `ACP_COUNT_TOKENS_PASSTHROUGH`, `ACP_COMPRESS_PROTOCOL`). Mostly read live per request (no restart needed), except `compressProtocol` which resolves once at boot like the env var did. `renderNone` stops the `mNNNNN` render tags from being injected into outgoing history — disable only if your workflow doesn't need ref-based compression (#933). Details in the [env table](#config-file-keys-for-environment-knobs-2030).
+- **Description:** Debug/diagnostic toggles that used to be env-only (`ACP_DUMP_BODY`, `ACP_DUMP_REQ`, `ACP_RAW_DUMP_DIR`, `BILI_DUMP_4XX`, `BILI_DUMP_4XX_MAX_BYTES`, `ACP_RENDER_NONE`, `ACP_NO_INJECT_TOOL`, `ACP_NO_COMPRESS_PROMPT`, `ACP_COUNT_TOKENS_PASSTHROUGH`, `ACP_COMPRESS_PROTOCOL`). Mostly read live per request (no restart needed), except `compressProtocol` which resolves once at boot like the env var did. `renderNone` stops the `mNNNNN` render tags from being injected into outgoing history — disable only if your workflow doesn't need ref-based compression (#933). Retention bounds (#2412): dump dirs are write-only with no rotation by default — active body/SSE capture measured at ~63 GB/day can fill a disk in days. Set `maxTotalBytes` and/or `maxAgeDays` to bound them (oldest-first deletion, `err-*`/`summary-err-*` incident dumps protected, deletions logged at warn level); leave both unset for unbounded retention. Details in the [env table](#config-file-keys-for-environment-knobs-2030).
 
 ### `fakeCompletion`
 
@@ -1120,7 +1124,7 @@ Two optional knobs turn the chain into a **proxy-driven auto-folder** (`autoFold
 
 #### Agent-reported providers (fallback layer)
 
-An ACP-native agent (currently the `pi` extension) reports its own configured providers to the proxy once per process (`POST /__bili/agent-providers`): provider name, base URL, wire protocol, resolved API key, and model list. These recipes form a **fallback layer** — a chain may reference `"zhipu/glm-5"` without the dial fields being duplicated in the file, so a provider configured once in the agent's own config is directly usable as a summary target. Merge order is **file wins**: a file recipe with the same name shadows the agent's contribution for that provider entirely (including its models). The agent layer never persists to disk: keys live only in proxy process memory, are never returned by the configuration API, and never appear in logs. Skip rules on the reporting side: OAuth-authenticated providers, `auth.json` ("stored") credentials, providers whose endpoint points back at the proxy itself, and wire protocols without a summary dial (`bedrock`, `vertex`, `mistral`, `pi-messages`) are not reported. The Web UI marks agent-reported models with an `(agent)` badge in the target dropdown.
+An ACP-native agent (currently the `pi` extension) reports its own configured providers to the proxy once per process (`POST /__bili/agent-providers`): provider name, base URL, wire protocol, resolved API key, and model list. These recipes form a **fallback layer** — a chain may reference `"zhipu/glm-5"` without the dial fields being duplicated in the file, so a provider configured once in the agent's own config is directly usable as a summary target. Merge order is **file wins**: a file recipe with the same name shadows the agent's contribution for that provider entirely (including its models). The agent layer never persists to disk: keys live only in proxy process memory, are never returned by the configuration API, and never appear in logs. Skip rules on the reporting side: OAuth-authenticated providers, `auth.json` ("stored") credentials, providers whose endpoint points back at the proxy itself, and wire protocols without a summary dial (`bedrock`, `vertex`, `mistral`, `pi-messages`) are not reported; plain-HTTP non-loopback baseUrls are not sent either (the server would refuse them — the inline apiKey must not travel over plaintext, #2585). Intake is per-entry: a refused entry is logged and named in the response's `skipped` list instead of discarding the whole report — the remaining entries register normally. The Web UI marks agent-reported models with an `(agent)` badge in the target dropdown.
 
 The three levels, from broadest to most specific:
 
@@ -1609,6 +1613,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
+| `BILI_DUMP_MAX_AGE_DAYS` | `diagnostics.maxAgeDays` | unset (off) |
+| `BILI_DUMP_MAX_TOTAL_BYTES` | `diagnostics.maxTotalBytes` | unset (off) |
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | `network.exposureLogIntervalMs` | 3600000 (0 disables the log) |
 | `BILI_FAKE_BUF_CAP` | `fakeCompletion.bufCapBytes` | 16777216 |
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |

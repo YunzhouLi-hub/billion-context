@@ -26,6 +26,7 @@ import { applyImageCompressionPass, imageFullTrailingNote, imageUsageSuffix } fr
 import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
@@ -43,7 +44,7 @@ import { rewriteOpenaiJsonResponseAsync } from "../stream-openai.js";
 import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
-import { safePrefix, safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 import { clearUpstreamAlertsForHost, recordUpstreamAlert } from "../upstream-alerts.js";
 import { formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
@@ -329,6 +330,7 @@ export async function forward(
                     fs.writeFileSync(out, wireText);
                 }
                 log("info", `[debug] forwarded body written to ${out}`);
+                gcDumpDirIfConfigured(dumpDir);
             }
         } catch { /* best-effort */ }
     }
@@ -373,13 +375,23 @@ export async function forward(
             const reqPath = `${rawBase}-REQ.txt`;
             fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
+            gcDumpDirIfConfigured(path.dirname(rawBase));
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
     // #1884: sign the FINAL wire body right before the send — everything
     // upstream of this point (prepare* injection, compat, steering) already
     // mutated it, so any inbound signature is stale here.
-    if (req.method !== "GET" && req.method !== "HEAD") applyResign(headers, wireBody);
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        // #816 family: a lone surrogate in a string wire body (rebuilt from
+        // persisted compression state, model-authored text) serializes as an
+        // unpaired \uXXXX escape and strict upstreams reject the WHOLE body
+        // (non-retryable 400) — scrub before signing so the signature covers
+        // the bytes actually sent. Buffer bodies are raw passthrough bytes
+        // and are forwarded byte-faithfully, untouched.
+        if (typeof wireBody === "string") wireBody = scrubLoneSurrogatesOnWire(wireBody);
+        applyResign(headers, wireBody);
+    }
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
@@ -413,6 +425,7 @@ export async function forward(
     // the rewriter loop below so fetch and loop stop together.
     const clientAbort = new AbortController();
     registerRequestAbort(res, clientAbort);
+    if (clientAbort.signal.aborted) return;
     res.on("close", () => {
         if (!res.writableEnded) {
             // #1647: without this, a client killed by its own undici bodyTimeout
@@ -715,11 +728,15 @@ export async function forward(
                 const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
                 if (refolded) {
                     try {
-                        applyResign(headers, refolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
+                        // #816 family: the refold rebuilds the body from state
+                        // summaries — scrub string bodies again so a lone
+                        // surrogate can't poison the retry (see the #1884 seam).
+                        const wireRefolded = typeof refolded === "string" ? scrubLoneSurrogatesOnWire(refolded) : refolded;
+                        applyResign(headers, wireRefolded);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: wireRefolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
-                            wireBody = refolded; // #1900: track the accepted re-send as the wire base
+                            wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
                             upstreamResult = retried;
                             log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
                         } else {
@@ -792,6 +809,7 @@ export async function forward(
             const resPath = `${rawBase}-RES.txt`;
             fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
             log("info", `[debug] RAW response dump: ${resPath}`);
+            gcDumpDirIfConfigured(path.dirname(rawBase));
         } catch (err) { logDumpFailure("RES dump", err); }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too

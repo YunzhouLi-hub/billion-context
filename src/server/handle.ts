@@ -23,6 +23,7 @@ import { storeEffectiveImageCompression, type ImageCompressionSettings } from ".
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
+import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "../thirdparty-scan.js";
@@ -47,7 +48,7 @@ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encodin
 import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { emergencyNudge } from "./budget.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -516,11 +517,7 @@ export async function handle(
             }
             if (routeKey === undefined && providerKeys.length > 0) warnRouteMissIfNew(diagOrigin, model, providerKeys, log);
             resolvedNativeWindow = native;
-            // #321 PR-E1: a codex client carries its OWN window perception
-            // (bundled model table + 272K unknown-model fallback) and
-            // auto-compacts at 90% of it. If bili's budget exceeds what codex
-            // believes, codex's native compaction fires first — the #292
-            // misalignment. Cap the effective window at codex's perception.
+            // 优先客户端声明及当前 Codex 缓存，再用发布时模型表对齐窗口，避免旧表误裁剪新模型。
             // An operator's explicit compress.modelContextLimit is exempt
             // (operator tuning is owned by the operator — never floored and
             // never clamped); the clamped value is authoritative for this
@@ -528,13 +525,13 @@ export async function handle(
             // low-confidence fallback flag.
             const aligned = operatorWindowTuned
                 ? { limit: reqConfig.modelContextLimit, clamped: false }
-                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
             if (aligned.clamped) {
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
-                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (client-window alignment for model=${model}; current client metadata preferred over bundled fallback) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }
@@ -706,6 +703,12 @@ export async function handle(
         const sideAgent = pluginRequestAgentHeader(req.headers);
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
             && (isSideRequest(parsed, sideAgent)
+                // #2503: dsh title sidecar — its output budget grew past the
+                // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
+                // recognize it by system text so it keeps the raw key instead
+                // of forking onto a persisted |sub: ghost (#2241 scenario A).
+                || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                    && isDshTitleRequest(parsed))
                 || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                     && req.headers["x-bili-ws-lane"] === undefined
                     && hasLeakedBiliToolsOnly(parsed)
@@ -1508,7 +1511,12 @@ export async function handle(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
-        const sideIntent = isSideRequest(parsed, requestAgent);
+        // #2503: dsh's title-gen sidecar grew past the <=200 budget heuristic on
+        // dsh 0.2.1-alpha.2 (preset maxOutputTokens 64 -> 4096); recognize it by
+        // system text so it keeps the raw key instead of forking onto a persisted
+        // |sub: ghost (#2241 scenario A). Explicit main intent still vetoes.
+        const dshTitleSidecar = pluginAgentHeader(req.headers) === "dsh" && requestAgent !== "main" && isDshTitleRequest(parsed);
+        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request 409
         // discipline above has already accepted this request (inherited prefix
@@ -1532,7 +1540,7 @@ export async function handle(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
@@ -1703,6 +1711,17 @@ export async function handle(
                         }
                     }
                 }
+            }
+            // #2283 sub-defect 1: emit [window-change] when the per-session resolution
+            // triple (model/source/base) moves mid-session. Placed pre output-headroom so
+            // #2096's per-request max_tokens reservation can't read as a base change.
+            {
+                const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
+                const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
+                if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
+                    log("info", `[${session.id}] [window-change] ${prevRes.m}/${prevRes.s}/${prevRes.b} -> ${curRes.m}/${curRes.s}/${curRes.b} (mid-session window resolution changed; nudge/preflight now judge against base ${curRes.b} pre-output-headroom, source=${curRes.s}) (#2283)`);
+                }
+                if (session.metadata) session.metadata.lastWindowResolution = curRes;
             }
             let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
             // Fallback-derived windows are optimistic guesses: never let the
@@ -2005,6 +2024,7 @@ export async function handle(
                         );
                         const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
                         fs.writeFileSync(path.join(rawDir, `${Date.now()}-${safeSessionId(session.id)}-INCOMING.txt`), `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
+                        gcDumpDirIfConfigured(rawDir);
                     } catch (err) { logDumpFailure("INCOMING dump", err); }
                 }
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);

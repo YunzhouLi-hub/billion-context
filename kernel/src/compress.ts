@@ -15,6 +15,7 @@ import {
 import type { ResolvedRange } from "./boundaries.js";
 import { activeAncestorIds } from "./decompress.js";
 import { truncateLargeToolOutputs } from "./truncate-tools.js";
+import { scrubLoneSurrogates } from "./truncate.js";
 import { hideConsumedCompressCalls } from "./hide-consumed.js";
 import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
@@ -344,6 +345,17 @@ export function createCore(ports: Ports = {}): CompressionCore {
     input: ApplyCompressionInput,
   ): ApplyCompressionResult {
     const state: CompressionState = cloneState(input.state);
+    // #816 family: a model-authored summary can carry an unpaired surrogate
+    // half — e.g. the model copies a literal \uXXXX escape out of tool output
+    // into the tool-call argument, and JSON.parse of that argument yields a
+    // real lone code unit. Stored verbatim, it poisons every later request
+    // body that re-serializes the state (strict upstreams reject the whole
+    // body, non-retryable). Scrub at ingest so state never carries one. The
+    // wire layer (loop fetchUpstream / relay forward) scrubs again as the
+    // belt-and-braces for already-poisoned persisted state.
+    for (const spec of input.ranges) {
+      if (spec.summary) spec.summary = scrubLoneSurrogates(spec.summary);
+    }
     // Lazy run-id allocation (#2370): never advance nextRunId on a no-op
     // failure — the host forkSnapshot fingerprint hashes full state, so a bump
     // here would churn contextGeneration on every failed manual tool.

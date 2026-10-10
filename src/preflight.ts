@@ -254,8 +254,8 @@ export interface PreflightResult {
      *  unknown-baseline ones (#553 — the optimistic figure can undershoot by
      *  up to ~4x on dense replays, so only the upper bound proves a fit). */
     fitsWindow: boolean;
-    /** Why the loop stopped while the payload still overflows the window.
-     *  Undefined when the payload fits. */
+    /** 循环因窗口仍溢出或客户端取消而停止的原因。
+     *  即使压缩后的内容已能放入窗口，也必须保留取消状态。 */
     failure?: PreflightFailure;
 }
 
@@ -1914,7 +1914,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     }
     result.rangesRemaining = rangesRemaining;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
-    if (currentTokens >= limit) result.failure = failure;
+    if (deps.signal?.aborted) failure = ABORTED_FAILURE;
+    if (currentTokens >= limit || failure?.kind === "aborted") result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
     return result;
 }
