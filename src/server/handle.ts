@@ -13,7 +13,7 @@ import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peek
 import { codexAlignedWindow } from "../codex-models.js";
 import { MAX_REQUEST_BYTES } from "../fetch-util.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
-import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
+import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
 import { durableMessageGuards } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -1841,15 +1841,16 @@ export async function handle(
                     const stripped = cs.stripImages
                         ? stripHistoricalImages(parsed, protocol, keepRecent, anchoredCutoff !== undefined ? { cutoffIndex: anchoredCutoff } : undefined)
                         : { body: parsed, removed: 0 };
-                    // #1995: index recoverable historical images by ref from the UNSTRIPPED
-                    // body before stripping drops them, so decompress({ imageRef }) can pull
-                    // specific pixels back later. Gated on stripImages (recovery is only
-                    // meaningful when stripping removes something); latest-wins per request.
+                    // #1995/#2607: index recoverable historical images by ref from the RAW
+                    // inbound body on every request — archivable media now folds by default,
+                    // so decompress({ imageRef }) must reach those pixels even with
+                    // stripImages off; latest-wins per request. The post-prepare refresh
+                    // below merges in refs assigned during this turn's prepare.
                     // count_tokens requests skip the (pure bookkeeping) index rebuild but
                     // still strip with the same cutoff, so token counts stay representative
                     // of what the model turn would send. Eviction rides along (best-effort,
                     // throttled to once a minute).
-                    if (cs.stripImages && protocol && !countTokens) {
+                    if (protocol && !countTokens) {
                         session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state, session.id);
                         if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
                             session.lastImgPrune = Date.now();
@@ -1918,6 +1919,12 @@ export async function handle(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                // #2607: prepare just assigned numeric refs to this turn's new
+                // messages (archivable media folds by default) — archive their
+                // pixels before preflight or the model can fold them away.
+                if (!countTokens && !responsesCompact && protocol && prepared) {
+                    session.incomingImageIndex = refreshIncomingImageIndex(parsed, protocol, session.state, session.id, session.incomingImageIndex);
+                }
                 // #2155 self-heal round: one evaluation per request, on the
                 // nudge-carrying prepared result (bypass lanes have nudge
                 // undefined and the hook no-ops inside). Side requests

@@ -89,9 +89,18 @@ export function assignRefs(
   for (const message of messages) {
     if (!message.id || options.shouldSkip?.(message)) continue;
 
-    if (map.byRaw[message.id]) continue;
+    const protectedNow = options.isProtected?.(message) ?? false;
+    const prev = map.byRaw[message.id];
+    if (prev) {
+      // Stale BLOCKED entries migrate to a fresh numeric ref once protection
+      // is lifted (#2607: #1188 pinned all media; archivable images now fold
+      // and must be citable via decompress({ imageRef })). Fresh number only —
+      // the id-never-reused contract holds.
+      if (prev === BLOCKED_REF && !protectedNow) delete map.byRaw[message.id];
+      else continue;
+    }
 
-    if (options.isProtected?.(message)) {
+    if (protectedNow) {
       map.byRaw[message.id] = BLOCKED_REF;
       continue;
     }

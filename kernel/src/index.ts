@@ -364,6 +364,7 @@ export {
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasMediaPayload,
+  hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
   isMessageProtectedWithPairing,
