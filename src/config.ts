@@ -1729,6 +1729,10 @@ type FileConfig = {
         noCompressPrompt?: boolean;
         countTokensPassthrough?: boolean;
         compressProtocol?: string;
+        /** #2412: retention bounds for debug dump dirs (dumps/, raw/, SSE dump dir) —
+         *  oldest-first deletion when exceeded. Unset/0 = off (default). */
+        maxTotalBytes?: number;
+        maxAgeDays?: number;
     };
     /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
     fakeCompletion?: { retries?: number; bufCapBytes?: number };
