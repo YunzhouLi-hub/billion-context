@@ -320,7 +320,7 @@ function identityWithText(message: CoreMessage, text: string): string {
  *  hosts emit a "\n"), so pairs carry a second seam-less key (p2) and the
  *  matcher probes both. Equal only when normalization collapses the
  *  difference. */
-export function turnKeyOf(reasoning: string | undefined, text: string | undefined): string {
+ function turnKeyOf(reasoning: string | undefined, text: string | undefined): string {
     normalizedIdentityWork++;
     const joined = reasoning !== undefined && reasoning !== "" && text !== undefined && text !== ""
         ? `${reasoning}\n${text}`
@@ -341,7 +341,7 @@ function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefin
 /** Turn context for the anchor seed loop: per assistant-core id, the turn
  *  key(s) and (for split-form turns) the sibling core id. Built lazily — a
  *  steady-state pass reuses stored anchors and never pays this. */
-export interface TurnCtx { p?: string; p2?: string; x?: string }
+interface TurnCtx { p?: string; p2?: string; x?: string }
 export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
     const ctx = new Map<string, TurnCtx>();
     for (let i = 0; i < msgs.length; i++) {
