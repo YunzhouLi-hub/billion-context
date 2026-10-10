@@ -1930,6 +1930,11 @@ test("#2604: live sessions seed their folded title at boot; resumed sids re-labe
             assert.equal(headers?.["x-bili-plugin-conversation"], "s-resume");
             await waitFor(() => names.some((n) => n.conversationId === "s-resume"), "lazy re-label POST");
             assert.deepEqual(names.find((n) => n.conversationId === "s-resume"), { conversationId: "s-resume", name: "Resumed Title" });
+
+            // a second stamped request hits the armed dedup key — no re-POST
+            _stateHeadersForTest()!("http://example.invalid/anthropic/v1/messages");
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(names.filter((n) => n.conversationId === "s-resume").length, 1);
         });
     } finally {
         proxy.close();
