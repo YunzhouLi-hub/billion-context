@@ -306,6 +306,8 @@ test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST sha
         { id: "m7", provider: "selfloop", api: "openai-completions" }, // baseUrl points at bili -> skip
         { id: "m8", provider: "nokey", api: "openai-completions" }, // key resolution empty -> skip
         { id: "m9", provider: "plainhttp", api: "openai-completions" }, // plain-HTTP non-loopback -> pre-skip (#2585)
+        { id: "m10", provider: "codexp", api: "openai-codex-responses" }, // responses-family mapping pin (#2590)
+        { id: "m11", provider: "azurep", api: "azure-openai-responses" }, // responses-family mapping pin (#2590)
     ];
     const ctx = {
         model: { baseUrl: "http://127.0.0.1:8787", api: "not-virtual" },
@@ -320,6 +322,8 @@ test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST sha
                 selfloop: { baseUrl: "http://127.0.0.1:8787" },
                 nokey: { baseUrl: "https://c.example" },
                 plainhttp: { baseUrl: "http://100.64.0.1:11434/v1" },
+                codexp: { baseUrl: "https://d.example" },
+                azurep: { baseUrl: "https://e.example" },
             })[p],
             getProviderAuthStatus: (p: string) => ({
                 zhipu: { configured: true, source: "environment" },
@@ -330,6 +334,8 @@ test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST sha
                 selfloop: { configured: true, source: "environment" },
                 nokey: { configured: false },
                 plainhttp: { configured: true, source: "environment" },
+                codexp: { configured: true, source: "environment" },
+                azurep: { configured: true, source: "environment" },
             })[p],
             getApiKeyForProvider: async (p: string) => (p === "nokey" ? undefined : `key-${p}`),
         },
@@ -341,15 +347,17 @@ test("#2336/#2585 pi reportAgentProviders: sanitized table, skip rules, POST sha
         assert.equal(calls[0].url, "http://127.0.0.1:8787/__bili/agent-providers");
         const body = calls[0].body as { agent: string; providers: Record<string, { baseUrl: string; api: string; apiKey: string; models: Record<string, { contextWindow?: number; outputTokens?: number }> }> };
         assert.equal(body.agent, "pi");
-        assert.deepEqual(Object.keys(body.providers).sort(), ["claude", "openai", "zhipu"], "skip rules applied");
+        assert.deepEqual(Object.keys(body.providers).sort(), ["azurep", "claude", "codexp", "openai", "zhipu"], "skip rules applied");
         assert.deepEqual(body.providers.zhipu.models, { "glm-5": { contextWindow: 200_000, outputTokens: 8192 }, "glm-5-air": {} });
         assert.equal(body.providers.zhipu.apiKey, "key-zhipu");
         assert.equal(body.providers.openai.api, "responses", "responses-family api mapping");
+        assert.equal(body.providers.codexp.api, "responses", "codex-responses-family api mapping");
+        assert.equal(body.providers.azurep.api, "responses", "azure-responses-family api mapping");
         // #2585: the plain-HTTP non-loopback provider is pre-skipped and named locally
         assert.ok(warns.some((w) => w.includes('provider "plainhttp" not reported') && w.includes("plain-HTTP non-loopback")), "pre-skip named locally");
         // the report is accepted by the core parser as-is (client/server contract)
         const parsed = parseAgentProviderReport(body);
-        assert.deepEqual(Object.keys(parsed.registered).sort(), ["claude", "openai", "zhipu"]);
+        assert.deepEqual(Object.keys(parsed.registered).sort(), ["azurep", "claude", "codexp", "openai", "zhipu"]);
     } finally {
         console.warn = realWarn;
         globalThis.fetch = realFetch;

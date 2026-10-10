@@ -130,6 +130,8 @@ const AGENT_PROVIDER_API: Record<string, "anthropic" | "openai" | "responses" | 
     "anthropic-messages": "anthropic",
     "openai-completions": "openai",
     "openai-responses": "responses",
+    "azure-openai-responses": "responses",
+    "openai-codex-responses": "responses",
     "google-generative-ai": "google",
 };
 
@@ -177,6 +179,12 @@ export async function reportAgentProviders(ctx: Ctx, agent: string): Promise<boo
         const provider = registry.getProvider(id);
         const baseUrl = provider?.baseUrl;
         if (typeof baseUrl !== "string" || !(baseUrl.startsWith("https://") || baseUrl.startsWith("http://"))) continue;
+        // Self-loop guard: skip providers whose endpoint IS this proxy — in
+        // the /bili/<upstream> prefix form the baseUrl embeds the proxy
+        // origin, and in MITM form detectProxyBase(baseUrl) resolves EVERY
+        // url through the env base, so compare origins instead of just
+        // testing detectProxyBase() !== undefined (which would skip the
+        // whole table whenever BILLION_CONTEXT_PROXY is set).
         let selfLoop = true;
         try {
             const u = new URL(baseUrl);
