@@ -413,6 +413,7 @@ export async function forward(
     // the rewriter loop below so fetch and loop stop together.
     const clientAbort = new AbortController();
     registerRequestAbort(res, clientAbort);
+    if (clientAbort.signal.aborted) return;
     res.on("close", () => {
         if (!res.writableEnded) {
             // #1647: without this, a client killed by its own undici bodyTimeout
