@@ -416,7 +416,13 @@ function relayWrapRoute(acc: DiscoverAcc, cfgRaw: string | undefined, fallback: 
  *  copilot, amp, and the static legs of crush/zed): add each host to the
  *  https inventory (deduped, lowercased; `stripPort` reduces `host:port` to
  *  the port-less hostname so the entry matches the port-less SNI whitelist).
- *  Semantics extracted byte-for-byte from those branches. */
+ *  Semantics extracted byte-for-byte from those branches.
+ *  The `host &&` guard drops empty entries by design: every caller resolves
+ *  hosts BEFORE calling (constant tables or nonEmpty()-gated config values),
+ *  so the branch is unreachable today — it is a latent backstop keeping an
+ *  unresolved future list from poisoning the SNI whitelist with "". Dropped,
+ *  not warned: pushing "" would be worse than skipping, and this pure
+ *  discovery helper has no log channel for an unreachable branch. */
 function addStaticHosts(acc: DiscoverAcc, hosts: readonly string[], stripPort: boolean): void {
     for (const h of hosts) {
         const host = (stripPort ? h.split(":", 2)[0]! : h).toLowerCase();

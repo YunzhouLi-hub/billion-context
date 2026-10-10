@@ -1489,7 +1489,9 @@ export async function handle(
             // (the 384K-token/7.5MB turn-37 single-message kill chain). High-water
             // mark, not a sum: the replay is the whole ledger every time, so the
             // max already bounds every future re-send; a sum would compound on each
-            // retry. Consumed by dshLedgerFloorTokens() in budget.ts.
+            // retry. Write-only by design: nothing decays or clears this value —
+            // dshLedgerFloorTokens() in budget.ts documents why the mark stays
+            // sticky and consumes it.
             const prevBytes = typeof session.metadata["dshCompactionRefusedBytes"] === "number" ? session.metadata["dshCompactionRefusedBytes"] as number : 0;
             session.metadata["dshCompactionRefusedBytes"] = Math.max(prevBytes, inboundBytes);
             session.metadata["dshCompactionRefusals"] = (typeof session.metadata["dshCompactionRefusals"] === "number" ? session.metadata["dshCompactionRefusals"] as number : 0) + 1;

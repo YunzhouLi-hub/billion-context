@@ -15,6 +15,10 @@ export type ManifestTool = {
 
 const MANIFEST_TIMEOUT_MS = 5000;
 const TOOL_TIMEOUT_MS = 60000;
+// #2652: slack added on top of a proxy-advertised summary budget when sizing the
+// compress-call HTTP wait — covers the non-budgeted work around the batch (preflight
+// split / token count / kernel apply / serialize) outside the totalTimeoutMs clock.
+const TOOL_TIMEOUT_OVERHEAD_MARGIN_MS = 30_000;
 const STATUS_TIMEOUT_MS = 5000;
 const ATTACH_HEALTH_DEADLINE_MS = 15000;
 const ATTACH_HEALTH_POLL_MS = 250;
@@ -158,9 +162,32 @@ async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: 
     }
 }
 
+// #2652: per-proxy advertised ceiling for a summary-producing tool call, learned from
+// the manifest at bootstrap. forwardTool sizes its compress-call HTTP wait from it so
+// the client never times out a fold the proxy is still legitimately running.
+const manifestToolDurations = new Map<string, number>();
+
+function recordManifestToolDuration(proxyBase: string, json: unknown): void {
+    const caps = (json as { capabilities?: { externalSummary?: { maxToolDurationMs?: unknown } } })?.capabilities?.externalSummary;
+    const value = caps?.maxToolDurationMs;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) manifestToolDurations.set(proxyBase, value);
+}
+
+/** Effective HTTP wait (ms) for a forwarded tool call. Only compress invokes the
+ *  external summary executor (bounded by totalTimeoutMs), so only it grows past the
+ *  base floor — and only when the proxy advertised a budget. Everything else, and any
+ *  proxy that advertises nothing (chain off / older build), keeps the historical floor. */
+export function effectiveToolTimeoutMs(proxyBase: string, tool: string): number {
+    if (tool !== "compress") return TOOL_TIMEOUT_MS;
+    const advertised = manifestToolDurations.get(proxyBase);
+    if (advertised === undefined) return TOOL_TIMEOUT_MS;
+    return Math.max(TOOL_TIMEOUT_MS, advertised + TOOL_TIMEOUT_OVERHEAD_MARGIN_MS);
+}
+
 export async function fetchManifest(proxyBase: string, format: "anthropic" | "openai" = "anthropic"): Promise<ManifestTool[]> {
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, MANIFEST_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
+    recordManifestToolDuration(proxyBase, json);
     if (format === "openai") {
         // OpenAI function style: {name, description, parameters} (plain JSON Schema).
         const data = json as { tools?: { openai?: { name?: string; description?: string; parameters?: unknown }[] } };
@@ -278,7 +305,7 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-    }, TOOL_TIMEOUT_MS, signal);
+    }, effectiveToolTimeoutMs(proxyBase, tool), signal);
     const data = json as { ok?: boolean; result?: string; error?: string; outcome?: string } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);

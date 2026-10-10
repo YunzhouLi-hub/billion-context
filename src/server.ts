@@ -308,6 +308,8 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
 const requestAborts = new WeakMap<http.ServerResponse, AbortController>();
 
 export function registerRequestAbort(res: http.ServerResponse, ac: AbortController): void {
+    // 取消可能已在 preflight 与 relay 交接前发生，close 事件不会重放。
+    if (requestAborts.get(res)?.signal.aborted || res.destroyed || res.writableEnded || res.socket?.destroyed) ac.abort();
     requestAborts.set(res, ac);
 }
 
@@ -2743,6 +2745,7 @@ export async function preflightCompressIfNeeded(
     // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
     let outbound: Prepared = prepared;
+    let fits: boolean;
     if (result.compressedRanges > 0) {
         const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
@@ -2773,7 +2776,7 @@ export async function preflightCompressIfNeeded(
         // The baseline anchor above stays raw deliberately: it is a floor for
         // future meters, and a deflated (k̂ < 1) value would only delay the
         // next trigger, never advance it.
-        const fits = unknownBaseline
+        fits = unknownBaseline
             ? result.fitsWindow
             : applyEstimateCalibration(rebuiltTextSize, kFactor, kOrigin, currentOrigin) + imageTokens < limit;
         // #1820: anchor the meter to the rebuilt payload's measured size — the
@@ -2784,46 +2787,53 @@ export async function preflightCompressIfNeeded(
         // deflation) mirrors the fit-gate quantity; lifetime is bounded (see
         // session.ts) so never-reporting upstreams fall back to legacy sizing.
         setPostRebuildAnchor(session, rebuiltTextSize + imageTokens);
-        if (fits) return rebuilt;
-        // #1839: the two measurements disagree — preflight's own final view
-        // (post-fold content + images + wire overhead) fits, but the fresh
-        // normal-config rebuild measures over. That divergence produced the
-        // self-contradictory fail-fast ("context ~44231 … exceeds window
-        // 253725"). Forward once and let the upstream arbitrate (the #496
-        // house pattern): a genuinely over-window payload is rejected once
-        // and armOverflowShrink recovers with real evidence; a fitting
-        // payload is no longer refused on a stale measurement. One forward
-        // only — the #330 relaxed-zone caveat still bounds the risk.
-        if (!unknownBaseline && result.failure?.kind !== "aborted" && result.payloadEstimate < limit) {
-            log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
-            return rebuilt;
-        }
-    } else if (unknownBaseline
-        ? result.fitsWindow
-        : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit) {
-        // [#autoFold] A growth-armed payload fits the real window by definition,
-        // so a zero-progress fold is not an error — but it does mean the chain
-        // could not deliver at all. Arm the cooldown right here (the arm branch
-        // below is unreachable from this path — it sits after this return) so
-        // classic nudges resume instead of re-attempting the dead chain every
-        // turn. The arm is deliberately NOT gated on the calibrated payload:
-        // a calibration straddle (estimate < limit <= calibrated) used to skip
-        // it, re-firing the trigger every turn with a guaranteed-400 forward
-        // and no recovery (PR #2581 review) — now the straddle arms too, and
-        // the forwarded request's 400 arms overflow-shrink with real evidence.
-        if (growthArmed) {
-            log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
-            armAutoFoldBackoff(session);
-            markDirty(session);
-        } else {
-            log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
-        }
-        return prepared;
+    } else {
+        fits = unknownBaseline
+            ? result.fitsWindow
+            : estimateCoreMessages(prepared.processedMessages) + overheadEstimate + imageTokens < limit;
     }
     const f = result.failure;
-    if (f?.kind === "aborted") {
-        log("warn", `[${session.id}] preflight aborted (${f.detail}); not forwarding`);
-        return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
+    // 重建过程也会让出执行权；所有转发许可都必须在此重新检查取消。
+    if (clientAbort.signal.aborted || f?.kind === "aborted") {
+        const detail = f?.kind === "aborted" ? f.detail : "the client disconnected during preflight compression";
+        log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding`);
+        return { failFast: true, status: 0, message: detail, retryable: false, respond: false };
+    }
+    if (fits) {
+        if (result.compressedRanges === 0) {
+            // [#autoFold] A growth-armed payload fits the real window by definition,
+            // so a zero-progress fold is not an error — but it does mean the chain
+            // could not deliver at all. Arm the cooldown right here (the fail-open
+            // arm branch below is unreachable from this path — it sits after this
+            // return) so classic nudges resume instead of re-attempting the dead
+            // chain every turn. The arm is deliberately NOT gated on the calibrated
+            // payload: a calibration straddle (estimate < limit <= calibrated) used
+            // to skip it, re-firing the trigger every turn with a guaranteed-400
+            // forward and no recovery (PR #2581 review) — now the straddle arms
+            // too, and the forwarded request's 400 arms overflow-shrink with real
+            // evidence.
+            if (growthArmed) {
+                log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
+                armAutoFoldBackoff(session);
+                markDirty(session);
+            } else {
+                log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
+            }
+        }
+        return outbound;
+    }
+    // #1839: the two measurements disagree — preflight's own final view
+    // (post-fold content + images + wire overhead) fits, but the fresh
+    // normal-config rebuild measures over. That divergence produced the
+    // self-contradictory fail-fast ("context ~44231 … exceeds window
+    // 253725"). Forward once and let the upstream arbitrate (the #496
+    // house pattern): a genuinely over-window payload is rejected once
+    // and armOverflowShrink recovers with real evidence; a fitting
+    // payload is no longer refused on a stale measurement. One forward
+    // only — the #330 relaxed-zone caveat still bounds the risk.
+    if (result.compressedRanges > 0 && !unknownBaseline && result.payloadEstimate < limit) {
+        log("warn", `[${session.id}] preflight view fits (~${result.payloadEstimate}/${limit}) but the rebuilt payload measures over — forwarding once for upstream arbitration (#1839)`);
+        return outbound;
     }
     // [#autoFold] fail-fast is an OVERFLOW concept: a growth-armed payload
     // fits the real window by definition, so a fold that could not reach the

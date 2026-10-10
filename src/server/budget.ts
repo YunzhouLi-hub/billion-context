@@ -233,7 +233,14 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or
  *  undefined when no reduction is needed (requested already fits, or the cap
  *  drops below OUTPUT_CLAMP_FLOOR — i.e. input alone nearly fills the window,
- *  which is preflight/self-heal territory, not output starvation). */
+ *  which is preflight/self-heal territory, not output starvation).
+ *  #2490 ledger regime: when the planning basis is the refused dsh raw ledger
+ *  (dshLedgerFloorTokens), cap < 1024 means the HOST's own counter already
+ *  sits at the window wall — bili's folds cannot shrink it (refused
+ *  checkpoints never land), so no output budget recovers the session; a
+ *  sub-floor clamp would only starve a terminal turn. That surrender is
+ *  deliberate, not a gap (pinned in
+ *  tests/issue2490-ledger-floor-doomed-probe.test.ts). */
 export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number): number | undefined {
     const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
     // #2011: max_tokens / max_completion_tokens / max_output_tokens are integer-typed on every
@@ -253,7 +260,15 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
  *  session by the guard in handle.ts) into a token floor for the clamp's
  *  planning basis. bytes/4 mirrors the default estimator's chars/4 caliber
  *  (the replay is JSON text riding the same wires). 0 when nothing was
- *  recorded — legacy behavior. */
+ *  recorded — legacy behavior.
+ *  STICKY BY DESIGN: the guard records a high-water mark and nothing decays
+ *  or clears it while the session lives. While compaction stays refused the
+ *  raw ledger only grows (refused checkpoints never land), so the max bounds
+ *  every future re-send; decaying the floor would re-open the #2490 kill
+ *  chain. Lifetime ends with the session (metadata eviction). Known
+ *  conservative residue: flipping allowDshCompaction on mid-session lets
+ *  checkpoints land and shrink the ledger, but the floor stays at its old
+ *  high until eviction — fail-closed over-tightening, accepted. */
 export function dshLedgerFloorTokens(metadata: Record<string, unknown> | undefined | null): number {
     const bytes = metadata?.["dshCompactionRefusedBytes"];
     if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= 0) return 0;
