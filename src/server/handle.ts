@@ -47,7 +47,7 @@ import { DecompressedTooLargeError, decodeRequestBody } from "../content-encodin
 import { noInjectTool as knobNoInjectTool, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { anthropicBetaContextWindow, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, windowSourceLogged } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isDshTitleRequest, isServerToolUtilityCall, isSideRequest, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./dsh-compaction-guard.js";
 import { emergencyNudge } from "./budget.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
@@ -706,6 +706,12 @@ export async function handle(
         const sideAgent = pluginRequestAgentHeader(req.headers);
         const sideRequestLike = !countTokens && !responsesCompact && protocol !== null
             && (isSideRequest(parsed, sideAgent)
+                // #2503: dsh title sidecar — its output budget grew past the
+                // <=200 heuristic on dsh 0.2.1-alpha.2 (preset 64 -> 4096);
+                // recognize it by system text so it keeps the raw key instead
+                // of forking onto a persisted |sub: ghost (#2241 scenario A).
+                || (pluginAgentHeader(req.headers) === "dsh" && sideAgent !== "main"
+                    && isDshTitleRequest(parsed))
                 || (pluginAgentHeader(req.headers) !== undefined && sideAgent !== "main"
                     && req.headers["x-bili-ws-lane"] === undefined
                     && hasLeakedBiliToolsOnly(parsed)
@@ -1508,7 +1514,12 @@ export async function handle(
         // #1699: opencode v2 title-gen requests carry no max_tokens, so the budget
         // heuristic alone misses them. The host stamps its per-request persona id
         // (x-bili-plugin-agent); a known side-request agent routes verbatim by intent.
-        const sideIntent = isSideRequest(parsed, requestAgent);
+        // #2503: dsh's title-gen sidecar grew past the <=200 budget heuristic on
+        // dsh 0.2.1-alpha.2 (preset maxOutputTokens 64 -> 4096); recognize it by
+        // system text so it keeps the raw key instead of forking onto a persisted
+        // |sub: ghost (#2241 scenario A). Explicit main intent still vetoes.
+        const dshTitleSidecar = pluginAgentHeader(req.headers) === "dsh" && requestAgent !== "main" && isDshTitleRequest(parsed);
+        const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
         // a public-fork receipt either. The receipt's first-request 409
         // discipline above has already accepted this request (inherited prefix
@@ -1532,7 +1543,7 @@ export async function handle(
         // #2500 server-tool utility shape) diverts under a receipt.
         // #2170 measure 1: the decision itself is resolveSideLane() (pure,
         // truth-table-tested); demotedSide ⊆ lane==="side" by construction.
-        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : undefined });
+        const sideLane = resolveSideLane({ countTokens, responsesCompact, protocol, stripApplied: demotedSide, sideIntent, requestAgent, sideLabel: serverToolUtility ? "server-tool utility call (#2500)" : dshTitleSidecar ? "dsh title-gen sidecar (#2503)" : undefined });
         if (sideLane.lane === "side") {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
