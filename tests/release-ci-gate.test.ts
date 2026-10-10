@@ -21,6 +21,7 @@ type Run = { id: number; head_sha: string; status: string; conclusion: string | 
 const runs = new Map<string, Run>(); // `${workflow}@${sha}` -> newest run
 const dispatchLog: string[] = [];
 const failDispatch = new Set<string>();
+let flakyGetsLeft = 0; // first N runs-listing GETs respond 500 (transient-failure injection)
 
 const mock = http.createServer((req, res) => {
   const url = new URL(req.url ?? "/", "http://mock");
@@ -41,6 +42,11 @@ const mock = http.createServer((req, res) => {
       dispatchLog.push(`${wf}@${JSON.parse(body).ref}`);
       res.writeHead(204).end();
     });
+    return;
+  }
+  if (flakyGetsLeft > 0) {
+    flakyGetsLeft -= 1;
+    res.writeHead(500, { "Content-Type": "application/json" }).end(JSON.stringify({ message: "internal error" }));
     return;
   }
   const run = runs.get(`${wf}@${url.searchParams.get("head_sha")}`);
@@ -167,6 +173,20 @@ test("release-ci-gate wait: timeout with a lane still missing blocks publish", a
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /timed out/);
   assert.match(r.out, /ci-e2e\.yml/);
+});
+
+test("release-ci-gate dispatch: transient API errors on read-only calls are retried, not fatal", async () => {
+  runs.clear();
+  runs.set("ci.yml@prhead", { id: 2, head_sha: "prhead", status: "completed", conclusion: "success" });
+  // First two runs-listing GETs get HTTP 500; the retried third succeeds.
+  flakyGetsLeft = 2;
+  const r = await gate(["--dispatch"], {
+    REQUIRED_CI_WORKFLOWS: "ci.yml",
+    EXTRA_MATCH_SHAS: "prhead",
+    DRY_RUN: "1",
+  });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /reused green run at prhead/);
 });
 
 let port = 0;

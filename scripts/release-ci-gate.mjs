@@ -96,17 +96,50 @@ const extraShas = (process.env.EXTRA_MATCH_SHAS || "")
 
 const API = process.env.API_BASE || "https://api.github.com"; // API_BASE: test hook
 
+// Read-only calls tolerate transient API noise (network blips, 5xx, secondary
+// rate limits) with bounded retries — one hiccup during a long --wait poll
+// must not kill an otherwise-green release. POST dispatches are NEVER retried:
+// a double dispatch would burn CI on duplicate runs. Exhausted retries throw,
+// which main() turns into exit 1 — the fail-safe direction is unchanged.
+const RETRY_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = 1000;
+
+function isTransientHttp(res) {
+  if (res.status === 429 || res.status >= 500) return true;
+  return res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0";
+}
+
 async function api(path, init) {
-  const res = await fetch(`${API}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(init?.headers || {}),
-    },
-  });
-  return res;
+  const readOnly = !init || !init.method || init.method === "GET";
+  let lastErr;
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+    let res;
+    try {
+      res = await fetch(`${API}${path}`, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          ...(init?.headers || {}),
+        },
+      });
+    } catch (err) {
+      lastErr = err;
+      if (readOnly && attempt < RETRY_ATTEMPTS) {
+        await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS * attempt));
+        continue;
+      }
+      throw err;
+    }
+    if (isTransientHttp(res) && readOnly && attempt < RETRY_ATTEMPTS) {
+      if (res.body) await res.body.cancel().catch(() => {});
+      await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS * attempt));
+      continue;
+    }
+    return res;
+  }
+  throw lastErr;
 }
 
 // Newest run of `workflow` at `sha`, or null.
