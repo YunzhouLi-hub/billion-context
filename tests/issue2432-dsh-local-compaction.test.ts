@@ -168,7 +168,10 @@ test("drift pin: dsh checkpoint framing bytes are versioned (#2432)", () => {
     assert.equal(DSH_CHECKPOINT_PREAMBLE_PREFIX, "This is an automatically generated checkpoint condensing an earlier span of the conversation");
 });
 
-test("unit: carriesDshLocalCompactionSummary matches framing, never ordinary prose", () => {
+test("unit: carriesDshLocalCompactionSummary matches framing only on a user/text carrier (#2621)", () => {
+    // Positive: a freshly-landed checkpoint is a user-role plain-text message
+    // whose text carries the framing. (No knownIds set here → novelty gate
+    // skipped, so these exercise the carrier gate alone.)
     assert.equal(carriesDshLocalCompactionSummary([]), false, "empty history");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "plain prose" }]), false);
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag mid-message");
@@ -190,6 +193,24 @@ test("unit #2621: only user TEXT messages can carry framing — quotes from any 
     assert.equal(carriesDshLocalCompactionSummary([{ role: "assistant", contentType: "tool-call", text: QUOTE }]), false, "assistant tool-call args quoting the marker (bili's own compress echoes ride here)");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "assistant", contentType: "text", text: DSH_CHECKPOINT_PREAMBLE_PREFIX + " that a colleague pasted for reference" }]), false, "preamble quoted by the assistant");
     assert.equal(carriesDshLocalCompactionSummary([{ text: QUOTE }]), false, "role-less bare shape reads false (safe miss, #2621 direction)");
+});
+
+test("unit: carriesDshLocalCompactionSummary novelty gate — old ids never match (#2621)", () => {
+    const framed = `${DSH_CHECKPOINT_PREAMBLE_PREFIX} of the conversation so far.\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section`;
+    // A user/text message carrying the framing but whose id is ALREADY in the
+    // pre-turn ref map is a replay/quote, not a fresh landing → no match.
+    assert.equal(
+        carriesDshLocalCompactionSummary([{ id: "old", role: "user", contentType: "text", text: framed }], new Set(["old"])),
+        false, "an already-seen user/text quote of the framing is not a landing");
+    // The identical framed message with a FRESH id (absent from the pre-turn map) matches.
+    assert.equal(
+        carriesDshLocalCompactionSummary([{ id: "fresh", role: "user", contentType: "text", text: framed }], new Set(["other"])),
+        true, "a fresh user/text message carrying the framing is a landing");
+    // Omitting knownIds skips the novelty gate (carrier gate only) — the framed
+    // user/text message still matches, preserving the direct-caller contract.
+    assert.equal(
+        carriesDshLocalCompactionSummary([{ id: "whatever", role: "user", contentType: "text", text: framed }]),
+        true, "no knownIds set → novelty gate skipped, carrier gate decides");
 });
 
 test("e2e #2432: dsh replaying [checkpoint, retained tail] rebases the ACP state instead of drifting forever", async () => {
@@ -356,6 +377,41 @@ test("negative #2432: user pasting the framing while history is intact does NOT 
         const s = getSession(conv)!;
         assert.ok((s.state.blocks ?? []).some((b) => b.active), "full replay keeps the fold — no gap, no rebase");
         assert.ok(s.metadata.nativeCompactionBoundary === undefined, "no boundary without coverage decimation");
+    } finally {
+        await rig.close();
+    }
+});
+
+test("negative #2621: marker quoted by a NON-user carrier + real fold gap does NOT rebase", async () => {
+    const rig = await startRig({ injectTool: true, injectNudge: false });
+    const conv = "dshc-openai-falsecarrier";
+    try {
+        // Seed + fold → a live fold covering m00001–m00009. Replaying a decimated
+        // head that omits those ids yields a REAL foldCoverage gap (missing≥8,
+        // missing*2≥expected) with NO host compaction — signal ② alone.
+        await seedAndFold(rig, conv);
+        // The marker now survives ONLY inside an assistant message (the model
+        // "quoted" it from a transcript read) — a carrier that can never be a
+        // dsh checkpoint. Pre-#2621 the bare byte-match fired on this quote and
+        // rebased a healthy session; post-fix the carrier gate rejects it.
+        const r = await fetch(chatUrl(rig), {
+            method: "POST",
+            headers: dshHeaders(conv),
+            body: JSON.stringify({
+                model: MODEL,
+                messages: [
+                    { role: "user", content: "continue please" },
+                    { role: "assistant", content: `I checked the other session's transcript and it contained ${DSH_CHECKPOINT_OPEN_TAG} — not a boundary.` },
+                    seedInput()[12],
+                    seedInput()[13],
+                ],
+            }),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const s = getSession(conv)!;
+        assert.ok(s.metadata.nativeCompactionBoundary === undefined, "a non-user carrier quoting the marker must NOT trigger a native-compaction rebase (#2621)");
+        assert.ok(!conflictEventsOf(s).some((e) => e.kind === "native-compaction"), "no misattributed native-compaction conflict recorded (#2621)");
     } finally {
         await rig.close();
     }
