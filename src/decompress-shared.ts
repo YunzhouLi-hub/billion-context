@@ -279,13 +279,13 @@ function resolveImageRestore(args: Record<string, unknown>, ctx: ProxyToolCtx): 
     const raw = typeof args.imageRef === "string" ? args.imageRef.trim() : "";
     if (raw === "" || raw.toLowerCase() === "list") {
         if (!index || index.size === 0) {
-            return toolOk("[No restorable images right now — this request carries no indexed historical images (stripImages must be enabled and the client must resend them).]");
+            return toolOk("[No restorable images right now — this request carries no indexed historical images (the client must resend history bytes for them to be indexed).]");
         }
         const lines = describeRestorable(index);
         return toolOk(`[Restorable images (${lines.length}):]\n${lines.join("\n")}\nRestore one with decompress({ imageRef: "<ref>" }); it is written to a file you open with the read tool.`);
     }
     if (!index) {
-        return toolFail(`[decompress FAILED: no image history is indexed for this request (stripImages off?) — cannot restore "${raw}".]`);
+        return toolFail(`[decompress FAILED: no image history is indexed for this request — cannot restore "${raw}".]`);
     }
     const imgs = index.get(raw);
     if (!imgs || imgs.length === 0) {

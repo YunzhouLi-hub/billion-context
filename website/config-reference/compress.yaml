@@ -143,16 +143,6 @@ entries:
     desc_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。"
     site_en: "Compression prompt pack, resolved project pack → user pack → builtin. Builtins: \"default\" and \"lean\" (one-line tool descriptions). Not gated by acknowledgePromptsRisk."
     site_zh: "压缩提示词包，按 项目包 → 用户包 → 内置 解析。内置：\"default\" 与 \"lean\"（单行工具描述）。不受 acknowledgePromptsRisk 门控。"
-  - key: compress.stripImagesKeepRecent
-    type: number
-    default: "5"
-    group: compress
-    id: cw.sikr
-    render: compress-row
-    desc_en: "With stripImages on, images inside the N newest messages are kept (fallback window when no fold anchors the boundary)."
-    desc_zh: "开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。"
-    site_en: "With stripImages on, images inside the N newest messages (default 5) are kept."
-    site_zh: "开启剥离图片时，最新 N 条消息（默认 5）内的图片保留。"
   - key: compress.tiers
     type: boolean
     default: "true"
@@ -203,16 +193,6 @@ entries:
     desc_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
     site_en: "Subtraction form: recent-zone tools minus this list get full protection. An empty array here is rejected as a typo."
     site_zh: "减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。"
-  - key: compress.stripImages
-    type: boolean
-    default: "false"
-    group: compress
-    id: ct.si
-    render: compress-row
-    desc_en: "Strip image payloads from foldable history."
-    desc_zh: "从可折叠历史中剥离图片载荷。"
-    site_en: "Strip image payloads from foldable history (off by default)."
-    site_zh: "从可折叠历史中剥离图片载荷（默认关）。"
   - key: compress.visibilityMarkers
     type: boolean
     default: "true"
