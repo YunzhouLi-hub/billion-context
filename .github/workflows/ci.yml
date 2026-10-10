@@ -32,7 +32,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # #2637 plan #8 (owner-approved): fail-fast tiering — the ~0-1m guards gate
+  # the four platform legs so a broken commit stops in tier 1 instead of
+  # paying 4x(install+typecheck+suites+build). Guards with `if: pull_request`
+  # skip on push/dispatch (skipped needs count as satisfied). Behavior change:
+  # on guard failure the required legs show pending (not red); merge blocked.
   test:
+    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports]
     strategy:
       fail-fast: false
       matrix:

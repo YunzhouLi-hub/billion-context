@@ -1,11 +1,30 @@
 name: e2e-fake-codex
 
 on:
+  # #2637 plan #2: run when request-pipeline hot files (AGENTS.md §3) move;
+  # nightly (plan #3) keeps full daily coverage on master.
   pull_request:
+    paths:
+      - "src/server.ts"
+      - "src/server/**"
+      - "src/loop/**"
+      - "src/compress-loop*.ts"
+      - "src/stream*.ts"
+      - "src/persist.ts"
+      - "src/session*.ts"
+      - "src/agent/**"
+      - "tests/e2e/**"
+      - "kernel/**"
+      - "package-lock.json"
+      - ".github/workflows/ci-e2e-fake.yml"
+  schedule:
+    - cron: '30 16 * * *'
   workflow_dispatch:
 
 concurrency:
-  group: e2e-fake-${{ github.workflow }}-${{ github.ref }}
+  # #2637 plan #3: schedule-safe group — master pushes must not cancel the
+  # day's nightly run; same-ref pushes still supersede each other.
+  group: e2e-fake-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
 
 jobs:
