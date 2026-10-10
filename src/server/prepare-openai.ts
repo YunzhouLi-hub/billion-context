@@ -18,7 +18,7 @@ import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, externalSummaryEnabled } from "../external-summary-surface.js";
+import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -189,7 +189,7 @@ export async function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !autoFoldEngaged(loopConfig, session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path

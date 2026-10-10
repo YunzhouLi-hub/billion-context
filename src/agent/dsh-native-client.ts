@@ -211,7 +211,7 @@ function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "ligh
                     onOrigin(data.origin);
                     settled = true;
                 }
-                if (onTheme) {
+                if (onTheme && !cancelled) {
                     const theme = detectHostTheme();
                     if (theme !== undefined) onTheme(theme);
                 }

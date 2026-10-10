@@ -1,4 +1,5 @@
 import type { ResolvedKernelConfig } from "./compress-settings.js";
+import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
 
 export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversation model selects consumed ranges; the configured independent summary service generates the authoritative summary. Use object-form content: [{startId, endId, topic?}]. summary is optional and, if supplied, only a non-authoritative hint, not the committed summary. Selected source text and read-only context are sent to the configured service using its separate credentials. All candidates failing leaves originals unchanged. This mode overrides instructions above requiring you to write the final summary.]";
 
@@ -43,6 +44,29 @@ export function armAutoFoldBackoff(session: { metadata?: Record<string, unknown>
  *  "engaged" while the chain is on AND not in backoff. */
 export function autoFoldEngaged(config: unknown, session: { metadata?: Record<string, unknown> } | undefined): boolean {
     return autoFoldActive(config) && !autoFoldBackoffActive(session);
+}
+
+/** [#autoFold] Is growth folding actually ARMED for this request's window?
+ *  The wire prepares suppress classic nudges while auto-fold is engaged —
+ *  but on degenerate windows the rail folds nothing: the AUTO_FOLD_TARGET_MIN
+ *  clamp pushes the target up to the overflow target (window <= MIN, or the
+ *  codex-intercept lane's lowered bar below ~2xMIN), and an explicit
+ *  autoFoldTargetTokens >= the overflow target clamps the same way. Leaving
+ *  suppression keyed on engagement alone would silence nudges forever with
+ *  no fold and no backoff able to arm (PR #2581 review) — suppression must
+ *  require a target strictly below the overflow bar. overflowTarget:
+ *  preflight's effective bar (the codex lane lowers it); omit to use
+ *  config.modelContextLimit. Mirrors the target math in server.ts's
+ *  preflight — keep the two in sync. */
+export function growthFoldingArmed(config: unknown, overflowTarget?: number): boolean {
+    const resolved = config as ResolvedKernelConfig | undefined;
+    const ext = resolved?.externalSummary;
+    if (ext?.enabled !== true || ext.autoFold !== true) return false;
+    const overflow = overflowTarget ?? resolved?.modelContextLimit ?? 0;
+    if (!(overflow > 0)) return false;
+    const configured = ext.autoFoldTargetTokens ?? Math.round(overflow / 2);
+    const target = Math.max(AUTO_FOLD_TARGET_MIN, Math.min(configured, overflow));
+    return target < overflow;
 }
 
 function adaptSchema(value: unknown): unknown {
