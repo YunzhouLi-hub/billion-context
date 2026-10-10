@@ -12,6 +12,20 @@ export function externalSummaryEnabled(config: unknown): boolean {
     return (config as ResolvedKernelConfig | undefined)?.externalSummary?.enabled === true;
 }
 
+/** Upper bound (ms) on how long the proxy needs to execute a summary-producing
+ *  tool call while the external chain is active: the chain's totalTimeoutMs batch
+ *  deadline. The ConfiguredSummaryPlan clock bounds the whole batch to it, so one
+ *  compress call cannot run longer. Advertised in the plugin manifest so agent-side
+ *  tool bridges size their HTTP wait to the ACTUAL server ceiling instead of a fixed
+ *  constant that silently starves any budget raised above it (#2652). Undefined when
+ *  the chain is disabled: classic model-written summaries commit locally and are fast,
+ *  so bridges keep their base timeout then. */
+export function externalSummaryMaxToolDurationMs(config: unknown): number | undefined {
+    const ext = (config as ResolvedKernelConfig | undefined)?.externalSummary;
+    const total = ext?.budget?.totalTimeoutMs;
+    return ext?.enabled === true && typeof total === "number" && Number.isFinite(total) && total > 0 ? total : undefined;
+}
+
 /** [#autoFold] Growth folding is active for a request when the rail carries
  *  an ENABLED external chain that switched autoFold on. An unresolvable
  *  target collapses the chain to enabled=false (expandExternalSummaryChain

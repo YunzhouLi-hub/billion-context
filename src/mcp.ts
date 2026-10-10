@@ -74,6 +74,10 @@ export function resolveProxyOrigin(): string {
 }
 
 const TOOL_TIMEOUT_MS = 60_000;
+// #2652: slack added on top of a proxy-advertised summary budget when sizing the
+// compress-call HTTP wait — covers the non-budgeted work around the batch outside the
+// totalTimeoutMs clock (same rationale as src/agent/shared.ts).
+const TOOL_TIMEOUT_OVERHEAD_MARGIN_MS = 30_000;
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // #656: hosts that resume a session (claude --resume forks a NEW session id)
@@ -85,6 +89,7 @@ const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // the resumed one must not adopt a sibling's conversation.
 const ORPHAN_ADOPT = IDENTITY_BINDING && process.env.BILI_MCP_NO_ORPHAN_ADOPT !== "1";
 let manifestTools: McpToolDef[] = [];
+let manifestMaxToolDurationMs: number | undefined;
 let conversationId = CONVERSATION_FROM_ENV;
 // #760: every conversation this shim has ever registered — the default
 // binding plus any per-call ids seen so far (issue-once each).
@@ -107,11 +112,26 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 async function fetchManifest(): Promise<void> {
     const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
-    const data = (await res.json()) as { tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]> };
+    const data = (await res.json()) as {
+        tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]>;
+        capabilities?: { externalSummary?: { maxToolDurationMs?: unknown } };
+    };
+    // #2652: learn the summary budget ceiling so compress calls wait for it.
+    const advertised = data.capabilities?.externalSummary?.maxToolDurationMs;
+    if (typeof advertised === "number" && Number.isFinite(advertised) && advertised > 0) manifestMaxToolDurationMs = advertised;
     // Anthropic wire shape is the canonical MCP-compatible schema source.
     const anthropic = data.tools?.anthropic ?? [];
     manifestTools = anthropic.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema }));
     if (manifestTools.length === 0) throw new Error("manifest served no anthropic tools");
+}
+
+/** #2652: only compress invokes the external summary executor (bounded by
+ *  totalTimeoutMs), so only it grows past the base floor — and only when the proxy
+ *  advertised a budget. Everything else keeps the historical floor. */
+function effectiveToolTimeoutMs(tool: string): number {
+    if (tool !== "compress") return TOOL_TIMEOUT_MS;
+    if (manifestMaxToolDurationMs === undefined) return TOOL_TIMEOUT_MS;
+    return Math.max(TOOL_TIMEOUT_MS, manifestMaxToolDurationMs + TOOL_TIMEOUT_OVERHEAD_MARGIN_MS);
 }
 
 let manifestPromise: Promise<void> | null = null;
@@ -307,7 +327,7 @@ async function handleMessage(msg: {
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const out = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride, nativeThreadId !== undefined);
+                const out = await forwardTool(tool, args, effectiveToolTimeoutMs(tool), routeOverride, nativeThreadId !== undefined);
                 sendResult(id, { content: [{ type: "text", text: out.text }], isError: out.failed });
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC

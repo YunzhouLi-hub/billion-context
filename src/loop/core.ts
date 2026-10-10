@@ -732,6 +732,11 @@ export async function* runCompressLoop(
                     truncationRetried = true;
                     ctx.log(`[acp-loop] round ${round}: upstream truncated with no visible output reaching the client; retrying fetch once`);
                     try {
+                        // Same roundBody bytes on purpose: the retry re-issues the SAME
+                        // logical request (the gate above proves nothing client-visible
+                        // was emitted), so the body must stay byte-identical — rebuilding
+                        // it would shift prompt-cache leading-edge markers and break
+                        // prefix cache reuse on the re-fetch.
                         const respResult = await fetchUpstream(roundBody);
                         if (!respResult.response.body) {
                             respResult.clearTimer();

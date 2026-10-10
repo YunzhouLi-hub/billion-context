@@ -285,6 +285,16 @@ entries:
     desc_zh: "内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。"
     site_en: "<code>ccr</code> — content cache &amp; retrieve: large outputs are stored losslessly beside the session and replaced by a head excerpt plus pointer; the model fetches originals back via <code>acp_retrieve</code>. No cap or eviction; on by default in proxy mode since v2 (<span class='mech'>enabled, minToolTokens (~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>)."
     site_zh: "<code>ccr</code> —— 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 <code>acp_retrieve</code> 取回原文；无上限、永不清除；自 v2 起代理模式默认开（<span class='mech'>enabled, minToolTokens(~4000), excludeTools, toolName \"acp_retrieve\", maxHeadChars</span>）。"
+  - key: compress.search
+    type: object
+    default: "off"
+    group: compress
+    id: co.searchRoot
+    render: obj-item
+    desc_en: "Search-behavior settings for search_context; currently holds planAware re-ranking."
+    desc_zh: "search_context 的检索行为设置；当前含 planAware 重排。"
+    site_en: "<code>search</code> — search-behavior settings for search_context; currently holds <code>planAware</code>."
+    site_zh: "<code>search</code> —— search_context 的检索行为设置；当前含 <code>planAware</code>。"
   - key: compress.search.planAware
     type: boolean
     default: "false"
