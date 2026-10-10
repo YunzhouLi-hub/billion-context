@@ -28,6 +28,15 @@
 //     proving the retention above is Pass 0's work, not an accident.
 //   - Cross-wire client swap (anthropic -> chat, same session, ids re-minted
 //     during the protocol conversion): coverage must survive the swap.
+//   - MODEL-SWITCH (chat wire, #2636): the host re-serializes the SAME
+//     logical history onto a differently-shaped model (pi transform-messages
+//     on isSameModel=false): structured reasoning_content is inlined as
+//     plain text (the reasoning+text core pair collapses into ONE merged
+//     core) and image parts become a fixed placeholder line on a text-only
+//     target. Fold coverage must survive the shape churn (Pass 3/4), the
+//     covered thinking must not re-enter, and a later mid-history edit
+//     still re-enters honestly. Its own reconcile-off control proves this
+//     churn class re-bills the unfolded history without the layer.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -68,6 +77,17 @@ const FILLER = (seed: number, kb: number): string => {
     return Array.from({ length: unit }, (_, i) => para.replace(String(seed), `${seed}-${i}`)).join("");
 };
 
+/** Model-switch variant (#2636): every assistant turn carries structured
+ *  reasoning (qwen-style same-model replay) with a per-turn unique tail so
+ *  "the covered thinking re-entered the wire" is a binary assertion. */
+const THINK = (t: number): string =>
+    `Scratchpad ${t}: parse the request, enumerate candidates, weigh trade-offs (cost, latency, blast radius), verify assumptions, then commit. Unique marker scratch-${t}-final.`;
+/** Per-turn unique, padding-correct PNG data URL (identity is over the image
+ *  bytes — identical bytes across turns would collapse onto one id). */
+const IMG = (t: number): string => `data:image/png;base64,iVBORw0KGgo${"A".repeat(39)}${String(t).padStart(8, "0")}==`;
+/** pi's NON_VISION_USER_IMAGE_PLACEHOLDER, byte-stable (transform-messages). */
+const USER_IMAGE_PLACEHOLDER_PROOF = "(image omitted: model does not support images)";
+
 const asArr = (x: unknown): Item[] => (Array.isArray(x) ? (x as Item[]) : []);
 
 function parseRefIds(body: string): string[] {
@@ -93,6 +113,27 @@ function reserializeArgs(raw: string): string {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return ` { "v": 1 } `;
     const entries = Object.entries(parsed as Record<string, unknown>).reverse();
     return " { " + entries.map(([k, v]) => `${JSON.stringify(k)} : ${JSON.stringify(v)}`).join(" , ") + " } ";
+}
+
+/** The #2636 incident shape: the host replays the SAME logical history onto
+ *  a differently-shaped model (pi transform-messages, isSameModel=false):
+ *  reasoning_content is inlined into content as plain text (seamless join —
+ *  the reasoning+text core pair collapses into one merged core) and user
+ *  image parts become the fixed placeholder line (text part join "\n").
+ *  Tool ids and arguments are untouched — this churn class is PURELY
+ *  shape, which is exactly what the pre-#2636 passes cannot pair. */
+function churnModelSwitch(hist: Item[]): void {
+    for (const m of hist) {
+        if (m.role === "assistant" && typeof m.reasoning_content === "string") {
+            const reply = Array.isArray(m.content) ? m.content.map(String).join("") : String(m.content ?? "");
+            m.content = m.reasoning_content + reply;
+            delete m.reasoning_content;
+        } else if (m.role === "user" && Array.isArray(m.content)) {
+            const parts = asArr(m.content);
+            const text = parts.filter((p) => p.type === "text").map((p) => String(p.text ?? "")).join("\n");
+            m.content = parts.some((p) => p.type === "image_url") ? `${text}\n${USER_IMAGE_PLACEHOLDER_PROOF}` : text;
+        }
+    }
 }
 
 interface JudgeState {
@@ -295,7 +336,9 @@ function proofProxyOptions(upstreamPort: number, ctx: number): ProxyOptions {
 /** Wire-specific client history operations: how this wire spells a user
  *  turn, an assistant reply, a shell tool pair — and where the id scheme +
  *  argument serialization live (so the SWITCH phase can churn exactly
- *  those while keeping logical content identical). */
+ *  those while keeping logical content identical). The "model-switch"
+ *  variant (chat wire only, #2636) instead spells reasoning-bearing
+ *  assistant turns and image-bearing user turns, and churns the SHAPE. */
 interface WireOps {
     field: string;
     initHistory: () => void;
@@ -304,13 +347,46 @@ interface WireOps {
     pushToolPair: (t: number, result: string) => void;
     /** Rewrite every message id + re-serialize every tool argument in place. */
     churnIds: () => void;
+    /** Model-switch churn: re-serialize the history for a differently-shaped
+     *  model (reasoning inlined, images placeholdered); new turns after it
+     *  take the new model's shape (no reasoning field, no image parts). */
+    churnModelSwitch?: () => void;
     /** Edit one mid-history user turn (content edit — must honestly re-enter). */
     editMidHistory: () => void;
     payload: (url: string) => Item;
 }
 
-function makeOps(wire: Wire, hist: Item[]): WireOps {
+type Variant = "id-churn" | "model-switch";
+
+function makeOps(wire: Wire, hist: Item[], variant: Variant = "id-churn"): WireOps {
     const SHELL_ARGS = (t: number): string => JSON.stringify({ command: `ls -la mod-${t}`, cwd: `/ws/${t}` });
+    if (variant === "model-switch") {
+        assert.ok(wire === "chat", "model-switch variant is authored for the chat wire (the #2636 incident lane)");
+        let switched = false;
+        return {
+            field: "messages",
+            initHistory: () => { hist.push({ role: "system", content: "You are a coding agent operating in a sandbox. Follow repo conventions strictly." }); },
+            pushUser: (t) => {
+                const text = `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6);
+                hist.push(switched ? { role: "user", content: text } : { role: "user", content: [{ type: "text", text }, { type: "image_url", image_url: { url: IMG(t) } }] });
+            },
+            pushAssistant: (t, reply) => {
+                hist.push(switched ? { role: "assistant", content: reply } : { role: "assistant", content: reply, reasoning_content: THINK(t) });
+            },
+            pushToolPair: (t, result) => {
+                hist.push({ role: "assistant", content: null, tool_calls: [{ id: `call_t${t}`, type: "function", function: { name: "shell", arguments: SHELL_ARGS(t) } }] });
+                hist.push({ role: "tool", tool_call_id: `call_t${t}`, content: result });
+            },
+            churnIds: () => { /* id-scheme churn is the other variant's phase; ids are NOT the churn here. */ },
+            churnModelSwitch: () => { switched = true; churnModelSwitch(hist); },
+            editMidHistory: () => {
+                const u = hist.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Turn 2:")) as { content: string } | undefined;
+                assert.ok(u !== undefined, "chat model-switch: mid-history user turn not found for the edit");
+                u.content = u.content.replace("Turn 2:", `Turn 2 [${EDIT_MARKER}]:`);
+            },
+            payload: () => ({ model: MODEL_A, stream: true, messages: [...hist] }),
+        };
+    }
     switch (wire) {
         case "responses":
             return {
@@ -437,8 +513,10 @@ const sha16 = (b: string): string => createHash("sha256").update(b, "utf8").dige
 interface DriveResult { bodies: string[]; foldIdx: number; switchIdx: number; editIdx: number; unfoldLen: number; }
 
 /** Drives grow->fold->switch->edit on one wire and returns the judge-side
- *  body stream with the key indices. */
-async function driveIdentity(wire: Wire, sessionId: string, ctx: number): Promise<DriveResult> {
+ *  body stream with the key indices. The variant selects the SWITCH phase's
+ *  churn: "id-churn" (id scheme + argument serialization) or "model-switch"
+ *  (#2636 shape churn: reasoning inlined, images placeholdered). */
+async function driveIdentity(wire: Wire, sessionId: string, ctx: number, variant: Variant = "id-churn"): Promise<DriveResult> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `identity-${wire}-`));
     const prevXdg = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = tmp;
@@ -451,7 +529,7 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number): Promis
         });
     }
     const hist: Item[] = [];
-    const ops = makeOps(wire, hist);
+    const ops = makeOps(wire, hist, variant);
     const bodies: string[] = [];
     const trigger = makeProofTrigger(THRESHOLD, MIN_FOLD_T);
     const state: JudgeState = { wire, bodies, turn: 0, suppressTrigger: false };
@@ -503,11 +581,19 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number): Promis
         const settledLen = Buffer.byteLength(bodies[bodies.length - 1]!, "utf8");
         assert.ok(bodies[foldIdx]!.includes(SUMMARY_MARKER), `${wire}: fold round-2 body lacks the summary carrier`);
 
-        // Phase S: churn the whole id scheme + argument serialization, then
-        // continue the conversation on the SAME session.
-        ops.churnIds();
+        // Phase S: churn (id scheme + argument serialization, or the #2636
+        // model-switch shape churn), then continue the conversation on the
+        // SAME session.
+        if (variant === "model-switch") ops.churnModelSwitch?.();
+        else ops.churnIds();
+        const phaseLabel = variant === "model-switch" ? "MODEL-SWITCH" : "SWITCH";
+        // Judge the FIRST body after the churn, not the last: if the fold
+        // failed to attach, the unfolded replay goes out on round-1 and a
+        // fresh server-side compress may re-fold it — the healed round-2
+        // must never stand in for the retention proof.
+        const firstChurnBody = bodies.length;
         await sendTurn(MAX_TURNS + 1);
-        const switchIdx = bodies.length - 1;
+        const switchIdx = firstChurnBody;
         const switchBody = bodies[switchIdx]!;
         const switchLen = Buffer.byteLength(switchBody, "utf8");
         if (process.env.IDENTITY_PROOF_DUMP) {
@@ -519,17 +605,21 @@ async function driveIdentity(wire: Wire, sessionId: string, ctx: number): Promis
             });
             for (const line of reconcileLines) console.log(`reconcile[${wire}] ${line.slice(0, 400)}`);
         }
-        assert.ok(switchBody.includes(SUMMARY_MARKER), `${wire} SWITCH: summary carrier LOST after the id churn — coverage re-entered unfolded (#2396 regression, #2480 claim failed)`);
-        assert.ok(!switchBody.includes("file-2-row-"), `${wire} SWITCH: a covered tool result re-entered the wire verbatim — the fold span was re-billed`);
-        assert.ok(switchLen < unfoldLen, `${wire} SWITCH: post-churn body ${switchLen}B at or beyond the unfolded magnitude (ref ${unfoldLen}B) while the history only grew — full re-entry`);
-        console.log(`proof[${wire}] SWITCH ok id-churn retained-fold len=${switchLen}B (unfolded-ref=${unfoldLen}B, settled=${settledLen}B) sha=${sha16(switchBody)}`);
+        assert.ok(switchBody.includes(SUMMARY_MARKER), `${wire} ${phaseLabel}: summary carrier LOST after the churn — coverage re-entered unfolded (#2396 regression, #2480 claim failed)`);
+        assert.ok(!switchBody.includes("file-2-row-"), `${wire} ${phaseLabel}: a covered tool result re-entered the wire verbatim — the fold span was re-billed`);
+        assert.ok(switchLen < unfoldLen, `${wire} ${phaseLabel}: post-churn body ${switchLen}B at or beyond the unfolded magnitude (ref ${unfoldLen}B) while the history only grew — full re-entry`);
+        if (variant === "model-switch") {
+            assert.ok(!switchBody.includes("scratch-2-final"), `${wire} ${phaseLabel}: a covered assistant thinking re-entered the wire verbatim — the pair->merged churn re-billed folded reasoning (#2636 regression)`);
+            assert.ok(switchBody.includes(USER_IMAGE_PLACEHOLDER_PROOF), `${wire} ${phaseLabel}: the placeholder sanity marker is missing — the churn did not land`);
+        }
+        console.log(`proof[${wire}] ${phaseLabel} ok churn-retained-fold len=${switchLen}B (unfolded-ref=${unfoldLen}B, settled=${settledLen}B) sha=${sha16(switchBody)}`);
         // Growth continues folded after the churn.
         await sendTurn(MAX_TURNS + 2);
-        const after = bodies[bodies.length - 1]!;
-        assert.ok(after.includes(SUMMARY_MARKER), `${wire} post-switch growth lost the summary`);
-        assert.ok(!after.includes("file-2-row-"), `${wire} post-switch growth re-billed a covered tool result`);
-        assert.ok(Buffer.byteLength(after, "utf8") < unfoldLen, `${wire} post-switch growth re-billed the unfolded magnitude`);
-        console.log(`proof[${wire}] GROWTH-AFTER-SWITCH ok folded len=${Buffer.byteLength(after, "utf8")}B sha=${sha16(after)}`);
+        const growthBody = bodies[bodies.length - 1]!;
+        assert.ok(growthBody.includes(SUMMARY_MARKER), `${wire} post-switch growth lost the summary`);
+        assert.ok(!growthBody.includes("file-2-row-"), `${wire} post-switch growth re-billed a covered tool result`);
+        assert.ok(Buffer.byteLength(growthBody, "utf8") < unfoldLen, `${wire} post-switch growth re-billed the unfolded magnitude`);
+        console.log(`proof[${wire}] GROWTH-AFTER-SWITCH ok folded len=${Buffer.byteLength(growthBody, "utf8")}B sha=${sha16(growthBody)}`);
 
         // Phase E: mid-history content edit under the churned scheme must
         // honestly re-enter: the edited original becomes visible on the wire
@@ -566,6 +656,97 @@ test("identity proof (responses wire): id-scheme churn keeps fold coverage, edit
 
 test("identity proof (google wire): id-scheme churn keeps fold coverage, edits stay honest (#2480)", { timeout: 180_000 }, async () => {
     await driveIdentity("google", "identity-google", 1_000_000);
+});
+
+// #2636: the model-switch churn class (reasoning inlined pair->merged, image
+// parts placeholdered) — the same grow->fold->switch->edit arc on the chat
+// wire with reasoning-bearing turns and image-bearing user turns. Coverage
+// must survive the shape churn, the covered THINKING must not re-enter, and
+// the mid-history edit afterwards must still re-enter honestly.
+test("identity proof (chat wire, model switch): cross-model re-serialization keeps fold coverage (#2636)", { timeout: 180_000 }, async () => {
+    await driveIdentity("chat", "identity-chat-modelswitch", 200_000, "model-switch");
+});
+
+// Negative control for the #2636 churn class: WITHOUT the reconcile engine
+// the model-switch re-serialization re-bills the unfolded history — proving
+// the retention above is the reconcile layer's Pass 3/4 work, not an
+// accident, and that this churn class genuinely defeats the old world.
+test("identity proof (control, chat wire): reconcile OFF lets the model-switch churn re-bill the unfolded history (#2636)", { timeout: 180_000 }, async () => {
+    const prev = process.env.BILI_FOLD_RECONCILE;
+    process.env.BILI_FOLD_RECONCILE = "off";
+    try {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "identity-ms-ctl-"));
+        const prevXdg = process.env.XDG_STATE_HOME;
+        process.env.XDG_STATE_HOME = tmp;
+        const hist: Item[] = [];
+        const ops = makeOps("chat", hist, "model-switch");
+        const bodies: string[] = [];
+        const trigger = makeProofTrigger(THRESHOLD, MIN_FOLD_T);
+        const state: JudgeState = { wire: "chat", bodies, turn: 0, suppressTrigger: false };
+        let upstream: http.Server | undefined;
+        let proxy: http.Server | undefined;
+        try {
+            upstream = startJudgeUpstream(state, trigger);
+            upstream.listen(0, "127.0.0.1");
+            await listen(upstream);
+            const upstreamPort = (upstream.address() as { port: number }).port;
+            _setStoreForTest(new SessionStore({ enabled: false }));
+            setRegistryForTest({});
+            proxy = await startServer(proofProxyOptions(upstreamPort, 200_000));
+            await listen(proxy);
+            const proxyPort = (proxy.address() as { port: number }).port;
+            const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+            const post = async (t: number): Promise<string> => {
+                const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "identity-ms-ctl" }, body: JSON.stringify(ops.payload(url)) });
+                if (!res.ok) throw new Error(`ms-ctl turn ${t}: HTTP ${res.status}`);
+                return res.text();
+            };
+            const sendTurn = async (t: number): Promise<void> => {
+                state.turn = t;
+                ops.pushUser(t);
+                const raw = await post(t);
+                const reply = extractReply("chat", raw);
+                assert.ok(reply.length > 0, `ms-ctl turn ${t}: empty reply`);
+                ops.pushAssistant(t, reply);
+                if (t % 2 === 0) ops.pushToolPair(t, TOOL_RESULT_OK(t));
+            };
+            ops.initHistory();
+            let foldIdx = -1;
+            let sinceFold = 0;
+            for (let t = 0; t < MAX_TURNS; t++) {
+                const before = trigger.calls();
+                await sendTurn(t);
+                if (trigger.calls() > before) { foldIdx = bodies.length - 1; sinceFold = 0; }
+                else sinceFold++;
+                if (foldIdx >= 0 && sinceFold >= 2) break;
+            }
+            assert.ok(foldIdx >= 0 && bodies[foldIdx]!.includes(SUMMARY_MARKER), "ms-ctl: fold did not fire");
+            let unfoldLen = 0;
+            for (let i = 0; i < foldIdx; i++) unfoldLen = Math.max(unfoldLen, Buffer.byteLength(bodies[i]!, "utf8"));
+            ops.churnModelSwitch?.();
+            // Scan EVERY judge body since the churn: with the layer off, the
+            // unfolded replay goes out on round-1 and a fresh server-side
+            // compress may then re-fold it — judging only the LAST body
+            // would see the self-healed round-2 and miss the re-bill.
+            const firstChurnBody = bodies.length;
+            await sendTurn(MAX_TURNS + 1);
+            const churnBodies = bodies.slice(firstChurnBody);
+            assert.ok(churnBodies.length > 0, "ms-ctl: no body recorded after the churn");
+            const lost = churnBodies.every((b) => !b.includes(SUMMARY_MARKER));
+            const reBilled = churnBodies.some((b) => b.includes("file-2-row-") || b.includes("scratch-2-final") || Buffer.byteLength(b, "utf8") >= unfoldLen * 0.8);
+            assert.ok(lost || reBilled, "ms-ctl failed to fail: with reconcile OFF the model-switch churn should lose the summary and/or re-bill the folded payloads — if it survives, the positive test above is not actually exercising Pass 3/4");
+            console.log(`proof[chat-ms-ctl] VERDICT reconcile=off modelSwitchFoldLost=${lost} modelSwitchReBilled=${reBilled} bodiesSinceChurn=${churnBodies.length} maxLen=${Math.max(...churnBodies.map((b) => Buffer.byteLength(b, "utf8")))}B (unfolded-ref=${unfoldLen}B)`);
+        } finally {
+            await closeServer(proxy);
+            await closeServer(upstream);
+            if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
+            else process.env.XDG_STATE_HOME = prevXdg;
+            rmrf(tmp);
+        }
+    } finally {
+        if (prev === undefined) delete process.env.BILI_FOLD_RECONCILE;
+        else process.env.BILI_FOLD_RECONCILE = prev;
+    }
 });
 
 // Negative control: WITHOUT the reconcile engine the same id churn destroys
