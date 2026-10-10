@@ -4,6 +4,14 @@ on:
     pull_request:
         branches: [master]
 
+# #2637: same-ref supersede-cancel (pattern of merged #2635) — a rapid re-push
+# must not queue a second build+publish behind its own predecessor. The temp
+# version is monotonic per run_number (#1385), so a cancelled mid-publish run
+# leaves no residue: its version string is simply never published.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
 permissions:
     contents: read
     pull-requests: write

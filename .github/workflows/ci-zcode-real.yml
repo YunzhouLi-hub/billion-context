@@ -13,6 +13,11 @@ name: zcode-real
 # schema-canary test below fails loudly if upstream renames anything).
 
 on:
+  # #2637 plan #3: nightly full regression on master — daily backstop for
+  # the path filter below (schedule ignores paths; ZCODE_VERSION falls back
+  # to its '3.14.4' default when no dispatch input is present).
+  schedule:
+    - cron: '30 16 * * *'
   workflow_dispatch:
     inputs:
       zcode_version:
@@ -35,7 +40,8 @@ on:
       - src/mcp.ts
 
 concurrency:
-  group: zcode-real-${{ github.ref }}
+  # #2637 plan #3: 'nightly' keeps scheduled runs out of the per-ref cancel scope.
+  group: zcode-real-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
 
 permissions:
