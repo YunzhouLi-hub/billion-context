@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { gcDebugDir } from "../src/state-gc.ts";
+import { gcDebugDir, type DumpGcPolicy } from "../src/state-gc.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #2412: retention GC for debug dump dirs. Core contract under test:
@@ -47,7 +47,8 @@ test("byte cap trims oldest-first until under the bound", () => {
         makeFile(dir, "f-b.txt", 100 * KB, 3 * HOUR);
         makeFile(dir, "f-a.txt", 100 * KB, 4 * HOUR);
         // 400 KB total > 250 KB cap → drop f-a, then f-b → 200 KB left.
-        assert.equal(gcDebugDir(dir, { maxBytes: 250 * KB }, NOW), 2);
+        const policy: DumpGcPolicy = { maxBytes: 250 * KB };
+        assert.equal(gcDebugDir(dir, policy, NOW), 2);
         assert.deepEqual(names(dir), ["f-c.txt", "f-d.txt"]);
     } finally { rmrf(dir); }
 });
