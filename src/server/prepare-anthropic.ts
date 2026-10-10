@@ -56,6 +56,18 @@ export async function prepareAnthropic(
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
+    // #2648: when the host pins a system block to cache_control.scope:"global",
+    // Anthropic renders tools BEFORE system, so the six ACP tools bili injects here
+    // (narrower scope) land ahead of a global block → upstream 400 ("scope:global …
+    // found after content with a narrower cache scope"). Global-scope caching is the
+    // host's own cross-prompt posture; bili's per-session injection cannot sit ahead
+    // of it, so stand down (forward untouched) rather than 400. Healthy main turns
+    // use ephemeral/unscoped system, so they keep full compression.
+    if (!pluginMode && hasGlobalScopeSystem(parsed)) {
+        log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648)`);
+        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
     let processedMessages: CoreMessage[] = [];
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
@@ -368,4 +380,13 @@ function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
     const stops = parsed.stop_sequences;
     if (!Array.isArray(stops)) return false;
     return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
+}
+
+// #2648: true when any system block pins cache_control.scope:"global". bili's
+// narrower-scope ACP-tool injection renders ahead of such a block and 400s
+// upstream (see the passthrough gate above), so the host must be left untouched.
+function hasGlobalScopeSystem(parsed: AnthropicRequestBody): boolean {
+    const sys = parsed.system;
+    if (!Array.isArray(sys)) return false;
+    return sys.some((b) => (b.cache_control as { scope?: unknown } | undefined)?.scope === "global");
 }

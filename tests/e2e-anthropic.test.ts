@@ -369,6 +369,49 @@ test("e2e anthropic: auto-mode classifier (stop_sequences </severity>/</block>) 
     }
 });
 
+test("e2e anthropic: bare side call (no tools, globally-scoped system) bypasses compress injection (#2648)", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-bare-sidecall" },
+            // Notification-classifier shape from #2648: no `tools` field, system
+            // pinned to cache_control.scope:"global". Injecting non-global ACP
+            // tools ahead of a global block is what 400s upstream.
+            body: JSON.stringify({
+                model: "claude-test",
+                max_tokens: 64,
+                stream: true,
+                system: [
+                    { type: "text", text: "A user kicked off a Claude Code agent to do a coding task and walked away.", cache_control: { type: "ephemeral", scope: "global" } },
+                ],
+                messages: [{ role: "user", content: "Should we push a mobile notification?" }],
+            }),
+        });
+        assert.equal(resp.status, 200);
+        const raw = await resp.text();
+
+        const upstreamReq = JSON.parse(h.captured[0]!.body) as {
+            tools?: Array<{ name: string }>;
+            system?: string | Array<{ type: string; text?: string; cache_control?: { scope?: string } }>;
+        };
+        assert.ok(!upstreamReq.tools || upstreamReq.tools.length === 0, `bare side call must not gain injected ACP tools: ${JSON.stringify(upstreamReq.tools)}`);
+        const toolNames = (upstreamReq.tools ?? []).map((t) => t.name);
+        for (const banned of ["compress", "decompress", "search_context", "acp_status"]) {
+            assert.ok(!toolNames.includes(banned), `bare side call must not carry the ${banned} tool: ${JSON.stringify(toolNames)}`);
+        }
+        const sysText = typeof upstreamReq.system === "string" ? upstreamReq.system : (upstreamReq.system ?? []).map((b) => b.text ?? "").join("\n");
+        assert.ok(!/compress/i.test(sysText), `bare side call system must not gain the compress prompt: ${JSON.stringify(sysText)}`);
+        assert.match(sysText, /kicked off a Claude Code agent/);
+        assert.equal(typeof upstreamReq.system === "string" ? undefined : upstreamReq.system?.[0]?.cache_control?.scope, "global", "the client's scope:\"global\" breakpoint must survive verbatim");
+
+        const events = parseAnthropicSse(raw);
+        assert.equal(events.filter((e) => e.event === "message_stop").length, 1, "side-call verdict stream must reach the client unrewritten");
+    } finally {
+        await h.close();
+    }
+});
+
 test("e2e anthropic: client-sent cache_control breakpoints ride their logical blocks across turns (#1092 salvage / #1097 prerequisite)", async () => {
     // Breakpoint placement must be identity-keyed (content-hash ids through the
     // kernel round-trip), never index-based: a breakpoint that migrates to a
