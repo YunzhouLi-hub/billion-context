@@ -46,7 +46,7 @@ async function fixture(run: (base: string, opts: ProxyOptions, calls: Buffer[]) 
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true, stripImages: true, stripImagesKeepRecent: 1 },
+        compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -106,10 +106,9 @@ test("gzip history above 100 MiB reaches explicit image reduction and preserves 
     });
 });
 
-test("disabled stripping never silently drops images: rebuilt over-budget requests stop with a forward-stage 413", async () => {
-    await fixture(async (base, opts, calls) => {
-        opts.compress.stripImages = false;
-        const r = await send(base, largeBody(false), "large-no-strip");
+test("rebuilt over-budget requests stop with a forward-stage 413 without contacting upstream", async () => {
+    await fixture(async (base, _opts, calls) => {
+        const r = await send(base, largeBody(false), "large-over-budget");
         assert.equal(r.status, 413);
         const error = await r.json() as { error: { stage: string; type: string } };
         assert.equal(error.error.stage, "forward");
