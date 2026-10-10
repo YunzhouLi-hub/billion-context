@@ -1536,6 +1536,7 @@ function formatSeam(r: BiliCacheReport): string {
     if (r.seam.providerSide.count > 0) {
         out.push("▲ PROVIDER-SIDE MISS (previous request's message list fully preserved)");
         out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's message list is preserved in this one (byte-for-byte under the 512 KiB forensics cap; above it, proven by the stable recorded head plus exact message-count growth — any difference is only the appended tail); the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push(`  stateful-upstream check (#2483): if your upstream keeps a live session per conversation and validates the echoed history against its own transcript (claude-code-based relays such as magpie), bili's render tags on assistant text trip that check even though bili's own list is unchanged — set diagnostics.renderNone=true until per-route render-tags control ships; expect exactly ONE replay when flipping the flag mid-session`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
