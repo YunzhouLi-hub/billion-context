@@ -292,6 +292,43 @@ test("hot reload: rewriting the file between calls changes resolution", () => {
     assert.equal(knobs.streamKeepAliveMs(), 15_000);
 });
 
+test("dump GC caps: default off, floors, explicit-off env wins (#2412)", () => {
+    clearConfig();
+    assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    assert.equal(knobs.dumpGcMaxAgeMs(), null);
+
+    setConfig({ diagnostics: { maxTotalBytes: 8 * 1024 * 1024, maxAgeDays: 7 } });
+    assert.equal(knobs.dumpGcMaxTotalBytes(), 8 * 1024 * 1024);
+    assert.equal(knobs.dumpGcMaxAgeMs(), 7 * 86_400_000);
+
+    // floors: 1 MiB for bytes, 1 h for age
+    setConfig({ diagnostics: { maxTotalBytes: 1024, maxAgeDays: 0.001 } });
+    assert.equal(knobs.dumpGcMaxTotalBytes(), 1 << 20);
+    assert.equal(knobs.dumpGcMaxAgeMs(), (1 / 24) * 86_400_000);
+
+    // 0/negative file values = off
+    setConfig({ diagnostics: { maxTotalBytes: 0, maxAgeDays: -3 } });
+    assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    assert.equal(knobs.dumpGcMaxAgeMs(), null);
+
+    // a SET env var always wins over the file tier — including explicit off
+    setConfig({ diagnostics: { maxTotalBytes: 8 * 1024 * 1024, maxAgeDays: 7 } });
+    withEnv({ BILI_DUMP_MAX_TOTAL_BYTES: "16777216", BILI_DUMP_MAX_AGE_DAYS: "3" }, () => {
+        assert.equal(knobs.dumpGcMaxTotalBytes(), 16777216);
+        assert.equal(knobs.dumpGcMaxAgeMs(), 3 * 86_400_000);
+    });
+    withEnv({ BILI_DUMP_MAX_TOTAL_BYTES: "0" }, () => {
+        assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    });
+    withEnv({ BILI_DUMP_MAX_TOTAL_BYTES: "garbage" }, () => {
+        assert.equal(knobs.dumpGcMaxTotalBytes(), null);
+    });
+    withEnv({ BILI_DUMP_MAX_AGE_DAYS: "-1" }, () => {
+        assert.equal(knobs.dumpGcMaxAgeMs(), null);
+    });
+    clearConfig();
+});
+
 test("teardown", () => {
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
     else process.env.BILI_CONFIG_FILE = previousConfigFile;

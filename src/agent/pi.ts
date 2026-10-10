@@ -318,6 +318,36 @@ export function parentConversationIdOf(ctx: Ctx): string | undefined {
     return undefined;
 }
 
+// #2469: parentSession proves LINEAGE, not seeding. Pi's session header has
+// no seed marker, but the evidence sits in the child's own branch: fork()
+// copies the parent's entries verbatim, and pi persists the turn's user
+// message BEFORE its first provider request (runAgentLoop emits the prompt
+// messages' message_end — session-manager.appendMessage — ahead of the
+// stream's onPayload hook), so a seeded child's branch already holds
+// parent-length + 1 messages at first request, while a spawned subagent
+// (newSession({parentSession}), inherit_context off) holds only its own task
+// prompt. Counting the branch's conversation messages distinguishes the two
+// at zero network cost; hosts without getBranch (or where it throws) yield
+// undefined and keep today's always-attempt behavior (fail toward capability).
+// The hash prefix match inside tryForkAdoption stays the final gate either
+// way (#2394 opencode-lane contract), so a misclassified attempt only costs
+// one snapshot GET.
+export const FORK_SEED_MIN_REPLAYED_MESSAGES = 2;
+
+export function replayedMessageCount(ctx: Ctx): number | undefined {
+    try {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) return undefined;
+        let count = 0;
+        for (const entry of branch) {
+            if (entry !== null && typeof entry === "object" && (entry as { type?: unknown }).type === "message") count += 1;
+        }
+        return count;
+    } catch {
+        return undefined;
+    }
+}
+
 // omp's chat-completions payloads carry NO conversation signal (no
 // prompt_cache_key / session / user, and no session header — verified by dump),
 // so the proxy's openai identity falls to a content fingerprint that never
@@ -1019,6 +1049,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // on every model request.
         const forkAdopter = createForkAdopter((line) => console.error(`bili-plugin(${agent}): ${line}`));
         const forkParents = new Map<string, string | undefined>();
+        const forkSeedVerdicts = new Map<string, "seeded" | "lineage-only" | "unknown">();
         async function maybeAdoptForkChild(event: unknown, ctx: Ctx): Promise<void> {
             if (state.toolsReady !== true) return;
             const sid = sessionIdOf(ctx);
@@ -1026,6 +1057,21 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             if (!forkParents.has(sid)) forkParents.set(sid, parentConversationIdOf(ctx));
             const parent = forkParents.get(sid);
             if (parent === undefined || parent === "" || parent === sid) return;
+            // #2469: seeding evidence is evaluated ONCE per sid — the first
+            // model request IS the adoption window (later requests can only
+            // CHILD_CONFLICT), so a lineage-only verdict can never lose a
+            // later adoption opportunity. Lineage-only children skip every
+            // network call; their derivedFrom link (registerTools) stays
+            // read-only.
+            if (!forkSeedVerdicts.has(sid)) {
+                const count = replayedMessageCount(ctx);
+                const verdict = count === undefined ? "unknown" : count >= FORK_SEED_MIN_REPLAYED_MESSAGES ? "seeded" : "lineage-only";
+                forkSeedVerdicts.set(sid, verdict);
+                if (verdict === "lineage-only") {
+                    console.warn(`bili-plugin(${agent}): fork adoption for ${sid} skipped — lineage-only child (${count} message(s) in its own branch, no replayed parent history); the derivedFrom link stays read-only (#2469)`);
+                }
+            }
+            if (forkSeedVerdicts.get(sid) === "lineage-only") return;
             let proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
             if (proxyBase === undefined) return;

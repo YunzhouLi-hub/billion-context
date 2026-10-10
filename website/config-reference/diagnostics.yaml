@@ -47,6 +47,20 @@ entries:
     group: diagnostics
     desc_en: "Size cap for a single 4xx dump file."
     desc_zh: "单个 4xx 转储文件的大小上限。"
+  - key: diagnostics.maxTotalBytes
+    type: number
+    default: "unset (off)"
+    env: BILI_DUMP_MAX_TOTAL_BYTES
+    group: diagnostics
+    desc_en: "Total-size cap for debug dump dirs (dumps/, raw/, SSE dump dir); oldest files deleted first when exceeded (floor 1 MiB). Dumps have no rotation by default and can grow tens of GB/day under active capture (#2412)."
+    desc_zh: "调试转储目录（dumps/、raw/、SSE dump 目录）的总大小上限；超限时按最旧优先删除（下限 1 MiB）。转储默认无任何轮转，持续捕获下每天可增长数十 GB（#2412）。"
+  - key: diagnostics.maxAgeDays
+    type: number
+    default: "unset (off)"
+    env: BILI_DUMP_MAX_AGE_DAYS
+    group: diagnostics
+    desc_en: "Age cap in days for debug dump dirs; files older than this are deleted (floor 1 h). Off by default."
+    desc_zh: "调试转储目录的保留天数上限；超过该天数的文件被删除（下限 1 小时）。默认关闭。"
   - key: diagnostics.renderNone
     type: boolean
     default: "false"

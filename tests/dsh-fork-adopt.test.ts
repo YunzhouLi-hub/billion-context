@@ -226,6 +226,53 @@ test("tryForkAdoption degrades on snapshot failures without posting", async () =
     assert.equal(calls.some((c) => c.url.includes("/__bili/plugin/fork")), false);
 });
 
+test("tryForkAdoption surfaces bounded snapshot diagnostics instead of a bare status (#2469)", async () => {
+    const calls: Recorded[] = [];
+    const unavailable = routerFetch({ snapshot: () => new Response(JSON.stringify({ ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: "Error: multimodal or opaque content cannot be compared by text" }), { status: 409, headers: { "content-type": "application/json" } }) }, calls);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: unavailable });
+    assert.deepEqual(result, { outcome: "degraded", reason: "snapshot http 409 SNAPSHOT_UNAVAILABLE (Error: multimodal or opaque content cannot be compared by text)" });
+    assert.equal(calls.length, 1, "one snapshot attempt, no fork POST");
+    assert.equal(calls.every((c) => !c.url.includes("/__bili/plugin/fork")), true);
+});
+
+test("tryForkAdoption sanitizes control characters out of snapshot diagnostics (#2469)", async () => {
+    const dirty = { ok: false, code: "SNAP\x00SHOT\r\nCODE", error: "a\x01b\tc long ".repeat(10) };
+    const calls: Recorded[] = [];
+    const fetchImpl = routerFetch({ snapshot: () => new Response(JSON.stringify(dirty), { status: 409 }) }, calls);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl });
+    assert.equal(result.outcome, "degraded");
+    const reason = (result as { reason: string }).reason;
+    assert.ok(!/[\u0000-\u001f\u007f]/.test(reason), "no control characters survive into the log line");
+    // "SNAP\x00SHOT\r\nCODE" -> "SNAP SHOT CODE"; each "a\x01b\tc long " iteration
+    // becomes "a b c long " (11 chars x10 = 109, under the 120 cap: no ellipsis).
+    assert.match(reason, /^snapshot http 409 SNAP SHOT CODE \(a b c long( a b c long){9}\)$/);
+});
+
+test("tryForkAdoption degrades safely on non-JSON or oversized snapshot error bodies (#2469)", async () => {
+    const nonJson = routerFetch({ snapshot: () => new Response("<html>gateway exploded</html>", { status: 409 }) }, []);
+    assert.deepEqual(await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: nonJson }), { outcome: "degraded", reason: "snapshot http 409" });
+    // A body past the 1KB read cap is truncated mid-JSON: parsing must fail
+    // closed to the status-only reason, never hang or buffer unboundedly.
+    const oversized = routerFetch({ snapshot: () => new Response(JSON.stringify({ ok: false, code: "BIG", error: "x".repeat(5000) }), { status: 409 }) }, []);
+    assert.deepEqual(await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: oversized }), { outcome: "degraded", reason: "snapshot http 409" });
+});
+
+test("tryForkAdoption ends google children before any network request; responses go through the protocol (#2469)", async () => {
+    // Responses is projected client-side now (#2469 stage 2): the child gets a
+    // real snapshot GET and degrades on the identity match like any other wire.
+    const responsesCalls: Recorded[] = [];
+    const responsesFetch = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true }, 201) }, responsesCalls);
+    const responses = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }, fetchImpl: responsesFetch });
+    assert.deepEqual(responses, { outcome: "degraded", reason: "no prefix match" });
+    assert.equal(responsesCalls.filter((c) => c.url.includes("snapshot")).length, 1, "the responses child reaches the snapshot");
+    assert.equal(responsesCalls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "...but posts no fork receipt for a mismatch");
+    const googleCalls: Recorded[] = [];
+    const googleFetch = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)) }, googleCalls);
+    const google = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { contents: [{ role: "user", parts: [{ text: "hi" }] }] }, fetchImpl: googleFetch });
+    assert.deepEqual(google, { outcome: "degraded", reason: "wire unsupported (google)" });
+    assert.equal(googleCalls.length, 0);
+});
+
 test("tryForkAdoption surfaces fork rejections and replays", async () => {
     const conflict = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: false, code: "CHILD_CONFLICT" }, 409) }, []);
     const rejected = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: conflict });
