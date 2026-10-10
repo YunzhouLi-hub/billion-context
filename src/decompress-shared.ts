@@ -168,10 +168,20 @@ export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
 ): ProxyToolResult {
-    // #1995: image recovery is a distinct mode selected by imageRef (an mNNNNN ref,
-    // or "list"), independent of blockId/range — intercepted first so an image-ref
-    // call never trips the blockId-required gate below.
-    if (args.imageRef !== undefined) {
+    // #1995: image recovery is a distinct mode selected by a VALID imageRef — a
+    // non-blank string (mNNNNN ref or "list"), independent of blockId/range,
+    // intercepted first so an image-ref call never trips the blockId gate below.
+    // #2626: key on a NON-BLANK VALUE, not field presence — hosts/models emit
+    // ""/whitespace/null for optional fields, and presence-based dispatch hijacked
+    // the text path (valid blockId + imageRef:"" returned the image-list receipt
+    // instead of restoring the block). Blank/null/undefined ⇒ unspecified → fall
+    // through to block/range restore; a non-string non-null value is a loud param
+    // error, not a silent default to the image list.
+    const ir = args.imageRef;
+    if (ir != null && typeof ir !== "string") {
+        return toolFail('[decompress FAILED: imageRef must be a string (an mNNNNN ref or "list") — omit it to restore a text block]');
+    }
+    if (typeof ir === "string" && ir.trim() !== "") {
         return resolveImageRestore(args, ctx);
     }
     const rawBlockId = args.blockId;
