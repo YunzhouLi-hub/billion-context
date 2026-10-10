@@ -257,12 +257,15 @@ test("tryForkAdoption degrades safely on non-JSON or oversized snapshot error bo
     assert.deepEqual(await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl: oversized }), { outcome: "degraded", reason: "snapshot http 409" });
 });
 
-test("tryForkAdoption ends responses/google children before any network request (#2469)", async () => {
+test("tryForkAdoption ends google children before any network request; responses go through the protocol (#2469)", async () => {
+    // Responses is projected client-side now (#2469 stage 2): the child gets a
+    // real snapshot GET and degrades on the identity match like any other wire.
     const responsesCalls: Recorded[] = [];
     const responsesFetch = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true }, 201) }, responsesCalls);
     const responses = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }, fetchImpl: responsesFetch });
-    assert.deepEqual(responses, { outcome: "degraded", reason: "wire unsupported (responses)" });
-    assert.equal(responsesCalls.length, 0, "no snapshot GET, no fork POST, no manifest probe");
+    assert.deepEqual(responses, { outcome: "degraded", reason: "no prefix match" });
+    assert.equal(responsesCalls.filter((c) => c.url.includes("snapshot")).length, 1, "the responses child reaches the snapshot");
+    assert.equal(responsesCalls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "...but posts no fork receipt for a mismatch");
     const googleCalls: Recorded[] = [];
     const googleFetch = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)) }, googleCalls);
     const google = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: { contents: [{ role: "user", parts: [{ text: "hi" }] }] }, fetchImpl: googleFetch });

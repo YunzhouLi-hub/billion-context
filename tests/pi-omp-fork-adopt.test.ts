@@ -15,7 +15,7 @@ import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
 import { incomingCoreMessages } from "../src/fork-adoption.ts";
-import { anthropicBodyToCore, chatBodyToCore, createForkAdopter, forkIdentityHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest, tryForkAdoption, type ForkAdoptInput } from "../src/agent/fork-adopt.ts";
+import { anthropicBodyToCore, chatBodyToCore, createForkAdopter, forkIdentityHashOf, openaiBodyToCore, resetForkCapabilityCacheForTest, responsesBodyToCore, tryForkAdoption, type ForkAdoptInput } from "../src/agent/fork-adopt.ts";
 import { FORK_SEED_MIN_REPLAYED_MESSAGES, createBiliPlugin, replayedMessageCount } from "../src/agent/pi.ts";
 
 process.env.NODE_ENV = "test";
@@ -49,13 +49,64 @@ test("anthropicBodyToCore projects identically to the server's incomingCoreMessa
     assert.equal(client!.some((m) => m.role === "system"), false, "leading system stays hoisted out of the fold space");
 });
 
-test("chatBodyToCore discriminates the chat dialects and skips responses/google (#2399)", () => {
+test("chatBodyToCore discriminates the dialects; only google stays unprojected (#2399/#2469)", () => {
     assert.notEqual(chatBodyToCore({ messages: [{ role: "user", content: "hi" }] }), null, "openai projects");
     assert.notEqual(chatBodyToCore(anthropicBody), null, "anthropic projects");
-    assert.deepEqual(chatBodyToCore({ model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }), null, "responses skipped");
+    assert.notEqual(chatBodyToCore({ model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] }), null, "responses projects");
     assert.deepEqual(chatBodyToCore({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }), null, "google skipped");
     const openai = { messages: [{ role: "system", content: "s" }, { role: "user", content: "hi" }] };
     assert.equal(chatBodyToCore(openai)!.length, openaiBodyToCore(openai)!.length, "openai keeps the stage-1 projection");
+});
+
+// #2469 regression coverage (issue checklist): plain text, function
+// call/output, raw ids and identity hashes must match the server's pipeline —
+// "仅增加'支持'分支或借用文本字段不足以证明继承正确". The corpus exercises
+// every pre-projection mutation the replicas carry.
+test("responsesBodyToCore projects identically to the server's incomingCoreMessages responses branch (#2469 parity)", () => {
+    const corpus = [
+        // plain-text user/assistant turns
+        [
+            { type: "message", role: "user", content: "first original " },
+            { type: "message", role: "assistant", content: "second original " },
+            { type: "message", role: "user", content: "tail original" },
+        ],
+        // function call + output round-trip (raw call id must survive both sides)
+        [
+            { type: "message", role: "user", content: "check the weather" },
+            { type: "function_call", name: "get_weather", arguments: "{\"city\":\"SF\"}", call_id: "call-1" },
+            { type: "function_call_output", call_id: "call-1", output: "sunny, 18C" },
+            { type: "message", role: "assistant", content: "It is sunny." },
+        ],
+        // omp untyped user item + whitespace-only delta + bili-id healing
+        [
+            { role: "user", content: "untyped omp prompt" },
+            { type: "message", role: "assistant", content: "   \t  " },
+            { type: "message", role: "assistant", id: `msg-proxy-${"x".repeat(80)}`, content: "healed reply" },
+            { type: "reasoning", id: `msg-proxy-${"y".repeat(80)}`, summary: [] },
+        ],
+        // bili compaction echo: sentinel blob → handoff message; marker-only → drop
+        [
+            { type: "compaction", id: "fc_bili-abc", encrypted_content: "bili:acp:folded head summary" },
+            { type: "compaction", id: "fc_bili-old" },
+            { type: "message", role: "user", content: "post-compaction turn" },
+        ],
+        // mixed content parts (input_text / output_text / text)
+        [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "part one " }, { type: "text", text: "part two" }] },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "mixed parts reply" }] },
+        ],
+    ];
+    for (let i = 0; i < corpus.length; i += 1) {
+        const body = { model: "gpt-test", input: corpus[i] };
+        const client = responsesBodyToCore(body);
+        const server = incomingCoreMessages("responses", body);
+        assert.notEqual(client, null, `corpus ${i}: client projected`);
+        assert.notEqual(server, null, `corpus ${i}: server projected`);
+        assert.equal(client!.length, server!.length, `corpus ${i}: message count diverged`);
+        for (let j = 0; j < client!.length; j += 1) {
+            assert.equal(forkIdentityHashOf(client![j]!), forkIdentityHashOf(server![j]!), `corpus ${i} message ${j} identity diverged`);
+        }
+    }
 });
 
 type CtxShape = Parameters<typeof replayedMessageCount>[0];
@@ -147,20 +198,29 @@ test("createForkAdopter degrades once on prefix mismatch and stays done", async 
     assert.ok(lines.some((l) => l.includes("degraded (no prefix match)")));
 });
 
-test("createForkAdopter ends responses/google children before any network request (#2469)", async () => {
+test("createForkAdopter ends google children before any network request (#2469)", async () => {
+    resetForkCapabilityCacheForTest();
+    const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, snapshotRoute, forkRoute]);
+    const lines: string[] = [];
+    const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
+    const google = adoptInput({ child: "c-ggl", body: { contents: [{ role: "user", parts: [{ text: "hi" }] }] } });
+    await adopter.maybeAdopt(google);
+    await adopter.maybeAdopt(google);
+    assert.equal(calls.length, 0, "no manifest probe, no snapshot GET, no fork POST — the capability check precedes the network");
+    assert.ok(lines.some((l) => l.includes("c-ggl") && l.includes("wire requests are not supported") && l.includes("google")));
+});
+
+test("createForkAdopter lets responses children reach the protocol — no terminal wire skip (#2469 stage 2)", async () => {
     resetForkCapabilityCacheForTest();
     const { fetchImpl, calls } = fakeFetchRouting([manifestRoute, snapshotRoute, forkRoute]);
     const lines: string[] = [];
     const adopter = createForkAdopter((l) => lines.push(l), { fetchImpl });
     const responses = adoptInput({ child: "c-resp", body: { model: "gpt", input: [{ type: "message", role: "user", content: "hi" }] } });
-    const google = adoptInput({ child: "c-ggl", body: { contents: [{ role: "user", parts: [{ text: "hi" }] }] } });
     await adopter.maybeAdopt(responses);
-    await adopter.maybeAdopt(responses);
-    await adopter.maybeAdopt(google);
-    await adopter.maybeAdopt(google);
-    assert.equal(calls.length, 0, "no manifest probe, no snapshot GET, no fork POST — the capability check precedes the network");
-    assert.ok(lines.some((l) => l.includes("c-resp") && l.includes("wire requests are not supported") && l.includes("responses")));
-    assert.ok(lines.some((l) => l.includes("c-ggl") && l.includes("wire requests are not supported") && l.includes("google")));
+    assert.ok(calls.some((c) => c.url.includes("manifest")), "the responses child reaches the manifest probe");
+    assert.ok(calls.some((c) => c.url.includes("snapshot")), "...and the snapshot GET (identity 'x1' matches nothing → degrades, no fork POST)");
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0);
+    assert.ok(!lines.some((l) => l.includes("wire requests are not supported")), "no unsupported-wire skip for responses");
 });
 
 test("createForkAdopter never throws — an exploding network soft-degrades and closes the window", async () => {
@@ -498,6 +558,59 @@ test("pi lane: an exploding getBranch fails toward capability and still adopts (
         assert.equal(childSnapshot.status, 200, childSnapshotText);
         const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
         assert.equal(childBody.orderedMessages.length, 3, "unknown seeding evidence keeps today's always-attempt behavior");
+    } finally {
+        await h.close();
+    }
+});
+
+test("tryForkAdoption rejects a responses child whose prefix matches nothing (#2469 stage 2)", async () => {
+    const { fetchImpl, calls } = fakeFetchRouting([snapshotRoute]);
+    const result = await tryForkAdoption({ base: "http://px", parentConversationId: "p1", childConversationId: "c1", body: { model: "gpt", input: [{ type: "message", role: "user", content: "completely unrelated" }] }, fetchImpl });
+    assert.deepEqual(result, { outcome: "degraded", reason: "no prefix match" });
+    assert.equal(calls.filter((c) => c.url.endsWith("/__bili/plugin/fork")).length, 0, "no fork receipt is posted for a mismatch");
+});
+
+test("full chain: responses-wire child adopts an openai-seeded parent (#2469 stage 2)", async () => {
+    resetForkCapabilityCacheForTest();
+    const h = await harness();
+    try {
+        await seedParent(h, "resp-parent");
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("before_provider_request");
+        assert.ok(handler);
+        // The reporter's exact shape (#2469): pi on codex-class providers sends
+        // the responses wire; the parent was seeded through the openai chat
+        // lane. Plain-text ids align across wires (kernel emits contentType
+        // "text" in both converters), so the prefix must match cross-wire.
+        const ctx: Record<string, unknown> = {
+            ...pluginCtx(h, "resp-child", "resp-parent"),
+            sessionManager: {
+                getSessionId: () => "resp-child",
+                getHeader: () => ({ parentSession: "resp-parent" }),
+                getBranch: () => Array.from({ length: FORK_SEED_MIN_REPLAYED_MESSAGES }, (_, i) => ({ type: "message", message: { role: i % 2 === 0 ? "user" : "assistant", content: `replayed ${i}` } })),
+            },
+        };
+        const body = {
+            model: "claude-test", max_tokens: 1024, stream: false,
+            input: [
+                { type: "message", role: "user", content: "first original ".repeat(250) },
+                { type: "message", role: "assistant", content: "second original ".repeat(250) },
+                { type: "message", role: "user", content: "tail original" },
+                { type: "message", role: "user", content: "new fork tail" },
+            ],
+        };
+        await handler({ payload: body }, ctx);
+        const childSnapshot = await fetch(`${h.origin}/__bili/plugin/snapshot?conversationId=resp-child`);
+        const childSnapshotText = await childSnapshot.text();
+        assert.equal(childSnapshot.status, 200, childSnapshotText);
+        const childBody = JSON.parse(childSnapshotText) as { orderedMessages: unknown[] };
+        assert.equal(childBody.orderedMessages.length, 3, "the responses child inherited the parent prefix across wires");
+        // Replay acceptance (no FORK_PREFIX_CONFLICT on the child's first
+        // stamped request) needs a mock that speaks the responses SSE wire;
+        // it is covered generically by the openai full chain above plus the
+        // parity test pinning this body's client/server identity equality —
+        // exactly what publicForkInputMatches compares.
     } finally {
         await h.close();
     }
