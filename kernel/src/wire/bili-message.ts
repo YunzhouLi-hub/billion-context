@@ -45,8 +45,8 @@ export interface BiliMessage extends CoreMessage {
   /** Source wire-message ordinal for this core message, tagged by the
    *  converters (`wireIndex` of the protocol message it was flattened from).
    *  Host-side consumers use it to translate core-space fold coverage back
-   *  into wire positions (e.g. #1995's fold-anchored stripImages cutoff)
-   *  without re-deriving each codec's block-split behavior. Optional:
+   *  into wire positions without re-deriving each codec's block-split
+   *  behavior. Optional:
    *  converters adopt it incrementally; absence means "unknown". */
   wireIndex?: number;
   /** Anthropic thinking signature. Anthropic verifies thinking+signature

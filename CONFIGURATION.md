@@ -212,13 +212,11 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
-| `compress.stripImagesKeepRecent` | number | 5 | — | With stripImages on, images inside the N newest messages are kept (fallback window when no fold anchors the boundary). |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | Excluded from the recent protection zone (immediately compressible); an empty array excludes nothing (maximum protection). |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | Subtraction form: recent-zone tools minus this list get full protection; an empty array here is rejected as a typo. |
-| `compress.stripImages` | boolean | false | — | Strip image payloads from foldable history. |
 | `compress.visibilityMarkers` | boolean | true | — | Append visibility markers after compress/decompress/search_context/acp_status results; off stops imitated narration. |
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
@@ -1407,19 +1405,10 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   { "providers": { "https://your-relay.example": { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 3 } } } } }
   ```
 
-#### `stripImages`
+#### `stripImages` — REMOVED
 
-- **Type:** `boolean`
-- **Default:** `false`
-- **Status:** ACTIVE
-- **Description:** Opt-in removal of historical image payloads. When `true`, aged-out messages have their image parts dropped before the wire rebuild; an image-only message collapses to a single `[image]` text placeholder (mixed text+image messages keep their text). **Strip boundary (#1995):** on anthropic sessions with an active compression fold, the boundary is FOLD-ANCHORED — only wire messages covered by active folds are stripped, and the boundary moves only on compression events, so the stripped prefix stays byte-stable between folds (the prompt cache stops re-billing it every turn) and un-folded images stay live. Without an active fold, or on the other wires (whose strip placeholders would flip kernel message ids), the classic sliding window applies: every message except the most recent `stripImagesKeepRecent` is stripped. A freshly-sent image always sits in the un-stripped tail on the turn it arrives. **Recovery:** stripped pixels are recoverable via `decompress({ imageRef })` — each stripped image is indexed by its `mNNNNN` ref and spilled under `<state>/retrieve/img/<session>/` (best-effort 7-day TTL); preflight fold summaries carry the ref in their notes (`[image: png 1024x768 · m00042]`). **Default folding (#2607):** independent of this flag, archivable (inline base64/data-URL) media is no longer shielded from compression — it folds like any other message, with its pixels archived under the same `<state>/retrieve/img/<session>/` tree BEFORE the fold so `decompress({ imageRef })` restores them on demand; only media whose bytes bili cannot store (remote URLs, file references) stays permanently excluded from folds. The per-request image indexing that powers recovery therefore runs on every session, not only when this flag is on. This flag remains as the extra lever for stripping UN-folded history between compression events (cache slimming); with default folding, the #488 image-token floor can no longer grow monotonically in image-heavy sessions. **One-image residual (#2607):** the kernel pins the session-opening user message through folds (strict providers reject conversations with no user message), so if that opening message carries an inline image, that single image stays on the wire for the session's life; every later image folds away. Applies to both compression modes (in plugin mode the agent's own history is untouched; only the upstream-bound wire is slimmed). See issues #617, #2607.
-
-#### `stripImagesKeepRecent`
-
-- **Type:** `number`
-- **Default:** `5`
-- **Status:** ACTIVE
-- **Description:** With `stripImages: true`, how many trailing messages keep their images verbatim. Ignored unless `stripImages` is enabled. **Fallback role (#1995):** on anthropic sessions an active fold anchors the strip boundary instead; this window applies when no fold anchors it (and on all other wires).
+- **Type:** ~~`boolean`~~ / **`stripImagesKeepRecent`** ~~`number`~~ — removed (2026-10, follow-up to #2607/#2640)
+- **Description:** The opt-in wire-side image strip no longer exists. Default media folding (#2640: archivable media folds like any other message, pixels archived under `<state>/retrieve/img/<session>/` before the fold, `decompress({ imageRef })` restores them) made it redundant, and the strip itself was a turn-over-turn prompt-cache breaker on three of four wires (its sliding cutoff `len - keepRecent` moves the byte boundary every turn; only anthropic had the fold-anchored fix). Configs still carrying `compress.stripImages` / `compress.stripImagesKeepRecent` are inert: the keys are ignored and a one-time `[acp-config] … INERT` warning points at this note. Media whose bytes bili cannot store (remote URLs, file references) stays pinned on the wire — see #2609.
 
 #### `visibilityMarkers`
 

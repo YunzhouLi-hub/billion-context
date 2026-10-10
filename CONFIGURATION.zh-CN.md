@@ -212,13 +212,11 @@
 | `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
-| `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 从近期保护区排除（立即可压）；空数组合法＝不排除任何工具（最大保护）。 |
 | `compress.preserveRecentTools` | string[] | n/a (subtraction form) | — | 减法形式：近期区工具减去本列表得到完全保护；此处空数组按笔误拒绝。 |
-| `compress.stripImages` | boolean | false | — | 从可折叠历史中剥离图片载荷。 |
 | `compress.visibilityMarkers` | boolean | true | — | 在 compress/decompress/search_context/acp_status 结果后追加可见性标记；关闭可抑制模型模仿叙述。 |
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
@@ -1412,19 +1410,10 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   { "providers": { "https://your-relay.example": { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 3 } } } } }
   ```
 
-#### `stripImages`
+#### `stripImages` — 已移除
 
-- **类型：** `boolean`
-- **默认值：** `false`
-- **状态：** ACTIVE
-- **说明：** 可选的历史图像载荷移除。设为 `true` 时，老化消息在重建 wire 前会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。**剥离边界（#1995）：** anthropic 会话存在活跃压缩折叠时，边界为折叠锚定——只剥离被活跃折叠覆盖的 wire 消息，边界仅在压缩事件时移动，被剥离的前缀在两次折叠之间保持字节稳定（prompt cache 不再每轮重复计费），未折叠的图像保持可见。无活跃折叠时（以及其他 wire——其剥离占位符会翻转 kernel 消息 id）沿用经典滑动窗口：除最近 `stripImagesKeepRecent` 条外全部剥离。新发送的图像在其到达的那一轮必然落在未剥离尾部。**恢复：** 被剥离的像素可通过 `decompress({ imageRef })` 恢复——每个被剥离图像按 `mNNNNN` 引用建索引并 spill 到 `<state>/retrieve/img/<session>/`（尽力而为的 7 天 TTL）；preflight 折叠摘要的注释携带引用（`[image: png 1024x768 · m00042]`）。**默认折叠（#2607）：** 与本开关无关，可归档（内联 base64/data-URL）媒体不再受压缩豁免——它像普通消息一样参与折叠，其像素在折叠**之前**先归档到同一棵 `<state>/retrieve/img/<session>/` 目录树，`decompress({ imageRef })` 可随时按需取回；只有 bili 拿不到字节的媒体（远程 URL、文件引用）才永久排除在折叠之外。支撑恢复的逐请求图像索引因此对所有会话常开，而不仅在本开关开启时运行。本开关保留为「两次压缩事件之间剥离未折叠历史」的额外杠杆（精简缓存）；有了默认折叠，#488 图像 token 下限不会再在图像密集会话中单调增长。**单图残留（#2607）：** kernel 会保护会话首条用户消息穿过折叠（严格供应商拒绝无用户消息的会话），因此若开场消息携带内联图像，该单张图像将全程留在 wire 上；其后的所有图像均正常折叠消失。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617、#2607。
-
-#### `stripImagesKeepRecent`
-
-- **类型：** `number`
-- **默认值：** `5`
-- **状态：** ACTIVE
-- **说明：** 在 `stripImages: true` 时，末尾多少条消息保留其图像逐字转发。仅在启用 `stripImages` 时生效。**回退角色（#1995）：** anthropic 会话存在活跃折叠时剥离边界改为折叠锚定；此窗口在无折叠锚定时（以及所有其他 wire 上）生效。
+- **类型：** ~~`boolean`~~ / **`stripImagesKeepRecent`** ~~`number`~~ — 已移除（2026-10，#2607/#2640 后续）
+- **说明：** 可选的 wire 侧图像剥离已不存在。默认媒体折叠（#2640：可归档媒体像普通消息一样参与折叠，像素在折叠前归档到 `<state>/retrieve/img/<session>/`，`decompress({ imageRef })` 随时取回）使其成为冗余，且剥离本身在四条 wire 中的三条上是逐轮破坏 prompt cache 的机制（滑动截断 `len - keepRecent` 每轮移动字节边界；仅 anthropic 有折叠锚定修复）。配置中仍携带 `compress.stripImages` / `compress.stripImagesKeepRecent` 的将变为惰性：键被忽略，并给出一次性 `[acp-config] … INERT` 警告指向本说明。bili 拿不到字节的媒体（远程 URL、文件引用）保持钉在 wire 上——见 #2609。
 
 #### `visibilityMarkers`
 

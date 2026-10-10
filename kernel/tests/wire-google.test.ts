@@ -13,7 +13,6 @@ import {
   detectWireFormat,
   isWireFormat,
 } from "../src/wire/formats.js";
-import { stripHistoricalImages } from "../src/wire/strip-images.js";
 
 const IMG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
@@ -363,66 +362,6 @@ test("injectGoogleSystem goes into the leading user content, else prepends one",
     ],
   );
   assert.equal(injectGoogleSystem(contents, []), contents);
-});
-
-test("strip-images: google drops inlineData/fileData from old contents only", () => {
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { text: "old" },
-          { inlineData: { mimeType: "image/png", data: IMG } },
-          {
-            fileData: {
-              fileUri: "https://example.com/x.png",
-              mimeType: "image/png",
-            },
-          },
-        ],
-      },
-      { role: "model", parts: [{ text: "seen" }] },
-      {
-        role: "user",
-        parts: [
-          { text: "new" },
-          { inlineData: { mimeType: "image/jpeg", data: IMG } },
-        ],
-      },
-    ],
-  };
-  const r = stripHistoricalImages(body, "google", 1);
-  assert.equal(r.removed, 2);
-  const contents = rebuiltContents(r.body);
-  assert.deepEqual(contents[0], { role: "user", parts: [{ text: "old" }] });
-  assert.equal(contents[1], body.contents[1]);
-  assert.equal(contents[2], body.contents[2]);
-});
-
-test("strip-images: image-only google contents collapse to a text placeholder", () => {
-  const body = {
-    contents: [
-      {
-        role: "user",
-        parts: [{ inlineData: { mimeType: "image/png", data: IMG } }],
-      },
-      { role: "model", parts: [{ text: "seen" }] },
-    ],
-  };
-  const r = stripHistoricalImages(body, "google", 1);
-  assert.equal(r.removed, 1);
-  const contents = rebuiltContents(r.body);
-  assert.deepEqual(contents[0], {
-    role: "user",
-    parts: [{ text: "[image]" }],
-  });
-  assert.equal(contents[1], body.contents[1]);
-  const untouched = stripHistoricalImages(
-    { contents: [{ role: "user", parts: [{ text: "no image" }] }] },
-    "google",
-    1,
-  );
-  assert.equal(untouched.removed, 0);
 });
 
 test("google: edited core text re-renders plain while sibling raw parts and signature survive", () => {

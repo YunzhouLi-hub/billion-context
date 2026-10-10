@@ -29,11 +29,11 @@ function close(server: http.Server): Promise<void> {
 }
 
 // #2607: archivable media folds BY DEFAULT — its pixels must therefore be
-// archived by mNNNNN ref on EVERY session (not only stripImages ones), or a
+// archived by mNNNNN ref on EVERY session, or a
 // fold destroys them unrecoverably. Two passes: entry-time (messages that
 // already have refs) and post-prepare (messages whose ref was assigned during
-// this turn's prepare — e.g. a freshly-sent image). Neither strips anything:
-// with stripImages off the forwarded body must still carry the image part.
+// this turn's prepare — e.g. a freshly-sent image). No wire-side stripping
+// happens at all: until a fold fires, the forwarded body keeps the image part.
 test("default config archives inbound images by ref without stripping", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -100,7 +100,7 @@ test("default config archives inbound images by ref without stripping", async ()
         const files1 = readdirSync(dir);
         assert.equal(files1.length, 1);
         assert.match(files1[0], /^m\d+-[0-9a-f]{8}\.png$/);
-        // stripImages is off: nothing stripped from the forwarded body.
+        // No wire-side strip: the forwarded body still carries the image part.
         assert.ok(JSON.stringify(JSON.parse(captured[0].body.toString("utf8")).input).includes('"input_image"'));
 
         // Turn 2: the client re-sends history plus one text message. The
@@ -136,7 +136,7 @@ function completed(inputTokens: number): string {
     });
 }
 
-// The closed loop #2607 promises: with stripImages OFF, a fold still removes the
+// The closed loop #2607 promises: a fold removes the
 // pixels from the wire (they live on disk, keyed by the mNNNNN ref that rides
 // the summary placeholder) — and decompress({ imageRef }) walks the REAL
 // always-on index of a REAL post-fold session to hand them back. Everything

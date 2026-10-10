@@ -9,4 +9,3 @@ export * from "./demoted-thinking.js";
 export * from "./mirror.js";
 export * from "./util.js";
 export * from "./compress-detect.js";
-export * from "./strip-images.js";
