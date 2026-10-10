@@ -11,7 +11,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContext
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { codexAlignedWindow } from "../codex-models.js";
-import { MAX_REQUEST_BYTES } from "../fetch-util.js";
+import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_BYTES } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
 import { durableMessageGuards } from "../durable-message-guards.js";
@@ -76,6 +76,33 @@ export async function handle(
     proxyWatchers: Set<number>,
     initialWatcherPid: number | null,
     adminCtx: Parameters<typeof handleAdminRoute>[2],
+): Promise<void> {
+    const admission = new DecodedRequestAdmission();
+    const decodingAbort = new AbortController();
+    const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
+    res.on("close", close);
+    try {
+        await handleRequest(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
+    } finally {
+        res.removeListener("close", close);
+        admission.release();
+    }
+}
+
+async function handleRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    opts: ProxyOptions,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    instanceId: string,
+    instanceStartedAt: number,
+    proxyWatchers: Set<number>,
+    initialWatcherPid: number | null,
+    adminCtx: Parameters<typeof handleAdminRoute>[2],
+    admission: DecodedRequestAdmission,
+    decodingSignal: AbortSignal,
 ): Promise<void> {
     // #1440 P2 cut 1: the /__bili/* + /__acp/* management surface (security gates +
     // endpoint dispatch) moved to src/server/admin.ts behind the loopback +
@@ -174,11 +201,11 @@ export async function handle(
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
         if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
             try {
-                const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
+                const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_DECODED_REQUEST_BYTES, { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) });
                 bodyBuffer = decoded.body;
                 if (decoded.decoded) delete req.headers["content-encoding"];
             } catch (decErr) {
-                if (decErr instanceof DecompressedTooLargeError) throw decErr;
+                if (decErr instanceof DecompressedTooLargeError || decErr instanceof DecodedRequestBusyError || decodingSignal.aborted) throw decErr;
                 // #619: bili can't decode this content-encoding -> don't 400. Drop
                 // protocol so the request falls to the verbatim passthrough below,
                 // relaying the ORIGINAL still-encoded bytes (the reassignment never
@@ -189,10 +216,17 @@ export async function handle(
             }
         }
     } catch (err) {
+        if (decodingSignal.aborted || res.destroyed) return;
+        if (err instanceof DecodedRequestBusyError) {
+            log("warn", "503: large decoded request budget is busy");
+            res.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
+            res.end(JSON.stringify({ error: { type: "request_body_busy", stage: "decode", message: err.message } }));
+            return;
+        }
         if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError) {
             log("warn", `413: request body exceeds ${err.limit} bytes`);
             res.writeHead(413, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
+            res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
             return;
         }
         log("warn", `failed to prepare inbound request (${String(err)}) - 400`);
