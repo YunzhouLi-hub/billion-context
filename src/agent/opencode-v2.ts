@@ -444,7 +444,25 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 });
                             }
                         });
-                        void Promise.resolve(extraReg).then((reg) => { if (reg) registrations.push(reg); }).catch(() => {});
+                        // #2443: latch readiness only when the registration
+                        // actually settles. A rejected transform previously
+                        // left toolDeltaReady=true with the conditional tools
+                        // (acp_retrieve / acp_rule) silently absent until host
+                        // restart — no retry, no log (PR #2581 review). Now:
+                        // surface the rejection and re-arm the retry cadence
+                        // (the outer .finally clears toolDelta, so the next
+                        // routed request re-runs this whole probe).
+                        void Promise.resolve(extraReg)
+                            .then((reg) => { if (reg) registrations.push(reg); })
+                            .then(() => {
+                                state.toolDeltaReady = true;
+                                state.toolDeltaRetryAt = undefined;
+                            })
+                            .catch((err) => {
+                                console.error(`bili: opencode conditional-tool registration rejected (${err instanceof Error ? err.message : String(err)}) — will retry on the next routed request (#2443)`);
+                                state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
+                            });
+                        return;
                     }
                     state.toolDeltaReady = true;
                     state.toolDeltaRetryAt = undefined;

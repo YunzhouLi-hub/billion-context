@@ -15,7 +15,7 @@ import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, externalSummaryEnabled } from "../external-summary-surface.js";
+import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
@@ -147,7 +147,7 @@ export async function prepareGoogle(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !autoFoldEngaged(loopConfig, session) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
