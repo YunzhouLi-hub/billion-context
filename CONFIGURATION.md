@@ -226,6 +226,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of large tool results into short abstracts; originals go to the content store. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
+| `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
 | `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
 | `compress.imageCompression` | object | opt-in (disabled) | — | Opt-in lossy downscale via optional sharp before sending; image_full restores originals; proxy mode only. |
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | Override the kernel doctrine texts; load-bearing for quality — gated behind acknowledgePromptsRisk. |

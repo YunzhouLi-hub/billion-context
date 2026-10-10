@@ -398,6 +398,7 @@ bili --config ~/my-bili.json # use a different config file
 bili update                  # check & install a newer version now (bypasses throttle)
 bili --no-auto-update        # disable self-update for this run
 bili --auto-restart-on-update   # self-restart when a new version is installed (default off)
+bili --bin /path/to/client   # launcher: spawn this exact client binary instead of auto-detecting (env BILI_CLIENT_BIN)
 ```
 
 Flags override env vars and the config file. `bili --help` lists them all.
