@@ -44,7 +44,7 @@ import { rewriteOpenaiJsonResponseAsync } from "../stream-openai.js";
 import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
-import { safePrefix, safeSuffix } from "../text-safe.js";
+import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 import { clearUpstreamAlertsForHost, recordUpstreamAlert } from "../upstream-alerts.js";
 import { formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
@@ -382,7 +382,16 @@ export async function forward(
     // #1884: sign the FINAL wire body right before the send — everything
     // upstream of this point (prepare* injection, compat, steering) already
     // mutated it, so any inbound signature is stale here.
-    if (req.method !== "GET" && req.method !== "HEAD") applyResign(headers, wireBody);
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        // #816 family: a lone surrogate in a string wire body (rebuilt from
+        // persisted compression state, model-authored text) serializes as an
+        // unpaired \uXXXX escape and strict upstreams reject the WHOLE body
+        // (non-retryable 400) — scrub before signing so the signature covers
+        // the bytes actually sent. Buffer bodies are raw passthrough bytes
+        // and are forwarded byte-faithfully, untouched.
+        if (typeof wireBody === "string") wireBody = scrubLoneSurrogatesOnWire(wireBody);
+        applyResign(headers, wireBody);
+    }
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
@@ -718,11 +727,15 @@ export async function forward(
                 const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
                 if (refolded) {
                     try {
-                        applyResign(headers, refolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
+                        // #816 family: the refold rebuilds the body from state
+                        // summaries — scrub string bodies again so a lone
+                        // surrogate can't poison the retry (see the #1884 seam).
+                        const wireRefolded = typeof refolded === "string" ? scrubLoneSurrogatesOnWire(refolded) : refolded;
+                        applyResign(headers, wireRefolded);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: wireRefolded }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
-                            wireBody = refolded; // #1900: track the accepted re-send as the wire base
+                            wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
                             upstreamResult = retried;
                             log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
                         } else {
