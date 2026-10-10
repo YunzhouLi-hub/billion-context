@@ -1,6 +1,11 @@
 name: E2E (real codex)
 
 on:
+  # #2637 plan #3: nightly full regression on master — the daily backstop for
+  # the path-filtered PR trigger below (schedule ignores paths, so this run
+  # covers everything regardless of diff).
+  schedule:
+    - cron: '30 16 * * *'
   workflow_dispatch:
     inputs:
       forge:
@@ -30,9 +35,10 @@ on:
       - ".github/workflows/ci-e2e.yml"
 
 # One run per ref: a fresh push cancels the superseded in-flight run — the
-# suite spends real upstream tokens, never run it twice in parallel.
+# suite spends real upstream tokens, never run it twice in parallel. The
+# 'nightly' group keeps scheduled runs out of that cancel scope (#2637 #3).
 concurrency:
-  group: e2e-${{ github.ref }}
+  group: e2e-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
 
 jobs:

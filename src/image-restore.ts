@@ -259,6 +259,36 @@ export function buildIncomingImageIndex(
     return index;
 }
 
+/** #2607: post-prepare refresh of the incoming-image index. prepare assigns
+ *  numeric refs to this turn's NEW messages — and archivable media now folds by
+ *  default — so their pixels must be archived BEFORE preflight or the model can
+ *  fold them away unrecoverably. Re-indexes the same raw body against the
+ *  post-prepare state and MERGES into the existing index (union by on-disk
+ *  path): the entry-time pass already spilled files, and merging guards against
+ *  any future ref pruning inside prepare. writeRestoredImage's skip-if-exists
+ *  keeps the second pass to one stat per known image. */
+export function refreshIncomingImageIndex(
+    parsed: unknown,
+    protocol: WireProtocol,
+    state: CompressionState,
+    sessionId: string,
+    existing: Map<string, IndexedImage[]> | undefined,
+): Map<string, IndexedImage[]> {
+    const fresh = buildIncomingImageIndex(parsed, protocol, state, sessionId);
+    if (fresh.size === 0) return existing ?? new Map();
+    const merged = existing ? new Map(existing) : new Map<string, IndexedImage[]>();
+    const seen = new Set<string>();
+    for (const imgs of merged.values()) for (const im of imgs) seen.add(im.path);
+    for (const [ref, imgs] of fresh) {
+        const kept = imgs.filter((im) => !seen.has(im.path));
+        if (kept.length === 0) continue;
+        for (const im of kept) seen.add(im.path);
+        const prev = merged.get(ref);
+        merged.set(ref, prev ? [...prev, ...kept] : kept);
+    }
+    return merged;
+}
+
 /** Protocol-dispatching convenience: run the inbound body through the wire
  *  → core converter and return the flattened core messages (or undefined when
  *  the body does not parse for that protocol). */

@@ -337,6 +337,7 @@ interface MediaSidecar {
   rawOpenaiContentParts?: unknown[];
   rawAnthropicBlock?: unknown;
   rawResponsesItem?: unknown;
+  rawGoogleParts?: unknown[];
 }
 
 export function hasMediaPayload(msg: CoreMessage): boolean {
@@ -368,6 +369,116 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
     }
   }
   return false;
+}
+
+/** True when msg carries media whose bytes bili CANNOT store locally —
+ *  remote-URL images and opaque file references (DeepSeek Files API
+ *  `{type:"file"}`, Google `fileData`/`videoMetadata`) — so folding it would
+ *  destroy the payload permanently with no decompress({ imageRef }) restore
+ *  behind it (billion-context#1188; the missing Google detection was #2609).
+ *  Archivable media (inline base64 / data: URLs, which the host spills to disk
+ *  at arrival time) is deliberately NOT unrecoverable: since #2607 such
+ *  messages fold like ordinary text and stay citable by their mNNNNN ref.
+ *  The data-URL test mirrors the host archive channel (image-restore.ts
+ *  messageImageBytes) exactly, so "recoverable here" ⇔ "bytes actually
+ *  spilled there". */
+export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
+  const m = msg as CoreMessage & MediaSidecar;
+
+  const roc = m.rawOpenaiContent;
+  if (roc != null) {
+    const part = asObj(roc);
+    const url =
+      part?.type === "image_url" ? asObj(part.image_url)?.url : undefined;
+    if (!isInlineDataUrl(url)) return true;
+  }
+
+  if (Array.isArray(m.rawOpenaiContentParts)) {
+    for (const p of m.rawOpenaiContentParts) {
+      const part = asObj(p);
+      const url =
+        part?.type === "image_url" ? asObj(part.image_url)?.url : undefined;
+      if (!isInlineDataUrl(url)) return true;
+    }
+  }
+
+  const ab = asObj(m.rawAnthropicBlock);
+  if (ab) {
+    if (ab.type === "image" && !anthropicSourceArchivable(asObj(ab.source)))
+      return true;
+    if (ab.type === "tool_result") {
+      const content = ab.content;
+      if (Array.isArray(content)) {
+        for (const b of content) {
+          const blk = asObj(b);
+          if (!blk || blk.type === "text") continue;
+          if (blk.type === "image") {
+            if (!anthropicSourceArchivable(asObj(blk.source))) return true;
+            continue;
+          }
+          return true;
+        }
+      }
+    }
+    // redacted_thinking etc. share this field — ignored, parity with hasMediaPayload
+  }
+
+  const item = asObj(m.rawResponsesItem);
+  if (item) {
+    const parts: unknown[] = [];
+    if (item.type === "input_image") parts.push(item);
+    for (const key of ["content", "output"] as const) {
+      const arr = item[key];
+      if (Array.isArray(arr))
+        for (const p of arr) if (asObj(p)?.type === "input_image") parts.push(p);
+    }
+    for (const p of parts) {
+      if (!isInlineDataUrl(asObj(p)?.image_url)) return true;
+    }
+  }
+
+  // Google: inlineData carries bytes (archived); fileData URI refs and
+  // videoMetadata references do not. Unknown part types fold as today —
+  // pinning them would over-block future benign shapes.
+  if (Array.isArray(m.rawGoogleParts)) {
+    for (const p of m.rawGoogleParts) {
+      const part = asObj(p);
+      if (!part) continue;
+      if (part.fileData != null || part.videoMetadata != null) return true;
+      const fr = asObj(part.functionResponse);
+      if (fr && Array.isArray(fr.parts)) {
+        for (const np of fr.parts) {
+          const sub = asObj(np);
+          if (sub && (sub.fileData != null || sub.videoMetadata != null))
+            return true;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+function anthropicSourceArchivable(
+  source: Record<string, unknown> | undefined,
+): boolean {
+  if (!source) return false;
+  if (source.type === "base64") return typeof source.data === "string";
+  // A data: URL in the url source still carries its bytes inline.
+  if (source.type === "url") return isInlineDataUrl(source.url);
+  return false;
+}
+
+function asObj(v: unknown): Record<string, unknown> | undefined {
+  return typeof v === "object" && v !== null
+    ? (v as Record<string, unknown>)
+    : undefined;
+}
+
+/** Inline-bytes test mirroring parseDataUrl's shape (kernel core must not
+ *  import from src/wire/): only these URLs hold recoverable bytes. */
+function isInlineDataUrl(u: unknown): boolean {
+  return typeof u === "string" && /^data:[^;,]+(?:;base64)?,.+$/i.test(u);
 }
 
 function isObjWith(v: unknown, key: string, value: unknown): boolean {

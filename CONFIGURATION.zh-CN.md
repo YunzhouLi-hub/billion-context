@@ -226,6 +226,7 @@
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
+| `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
 | `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
 | `compress.imageCompression` | object | opt-in (disabled) | — | 可选有损缩放（依赖可选 sharp）后再发送；image_full 取回原图；仅限代理模式。 |
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | 覆盖内核教条文本；对压缩质量承重要——受 acknowledgePromptsRisk 门控。 |
@@ -1416,7 +1417,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
-- **说明：** 可选的历史图像载荷移除。设为 `true` 时，老化消息在重建 wire 前会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。**剥离边界（#1995）：** anthropic 会话存在活跃压缩折叠时，边界为折叠锚定——只剥离被活跃折叠覆盖的 wire 消息，边界仅在压缩事件时移动，被剥离的前缀在两次折叠之间保持字节稳定（prompt cache 不再每轮重复计费），未折叠的图像保持可见。无活跃折叠时（以及其他 wire——其剥离占位符会翻转 kernel 消息 id）沿用经典滑动窗口：除最近 `stripImagesKeepRecent` 条外全部剥离。新发送的图像在其到达的那一轮必然落在未剥离尾部。**恢复：** 被剥离的像素可通过 `decompress({ imageRef })` 恢复——每个被剥离图像按 `mNNNNN` 引用建索引并 spill 到 `<state>/retrieve/img/<session>/`（尽力而为的 7 天 TTL）；preflight 折叠摘要的注释携带引用（`[image: png 1024x768 · m00042]`）。默认关闭 —— 关闭期间，#488 图像 token 下限及其溢出 `502` 仍是图像密集型载荷的显式信号。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617。
+- **说明：** 可选的历史图像载荷移除。设为 `true` 时，老化消息在重建 wire 前会丢弃其图像部分；纯图像消息折叠为单个 `[image]` 文本占位符（图文混合消息保留其文本）。**剥离边界（#1995）：** anthropic 会话存在活跃压缩折叠时，边界为折叠锚定——只剥离被活跃折叠覆盖的 wire 消息，边界仅在压缩事件时移动，被剥离的前缀在两次折叠之间保持字节稳定（prompt cache 不再每轮重复计费），未折叠的图像保持可见。无活跃折叠时（以及其他 wire——其剥离占位符会翻转 kernel 消息 id）沿用经典滑动窗口：除最近 `stripImagesKeepRecent` 条外全部剥离。新发送的图像在其到达的那一轮必然落在未剥离尾部。**恢复：** 被剥离的像素可通过 `decompress({ imageRef })` 恢复——每个被剥离图像按 `mNNNNN` 引用建索引并 spill 到 `<state>/retrieve/img/<session>/`（尽力而为的 7 天 TTL）；preflight 折叠摘要的注释携带引用（`[image: png 1024x768 · m00042]`）。**默认折叠（#2607）：** 与本开关无关，可归档（内联 base64/data-URL）媒体不再受压缩豁免——它像普通消息一样参与折叠，其像素在折叠**之前**先归档到同一棵 `<state>/retrieve/img/<session>/` 目录树，`decompress({ imageRef })` 可随时按需取回；只有 bili 拿不到字节的媒体（远程 URL、文件引用）才永久排除在折叠之外。支撑恢复的逐请求图像索引因此对所有会话常开，而不仅在本开关开启时运行。本开关保留为「两次压缩事件之间剥离未折叠历史」的额外杠杆（精简缓存）；有了默认折叠，#488 图像 token 下限不会再在图像密集会话中单调增长。**单图残留（#2607）：** kernel 会保护会话首条用户消息穿过折叠（严格供应商拒绝无用户消息的会话），因此若开场消息携带内联图像，该单张图像将全程留在 wire 上；其后的所有图像均正常折叠消失。对两种压缩模式均生效（plugin 模式下 agent 自身历史不受影响，仅精简发往上游的 wire）。见 issue #617、#2607。
 
 #### `stripImagesKeepRecent`
 

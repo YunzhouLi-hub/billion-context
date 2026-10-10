@@ -7,6 +7,10 @@ name: e2e-dsh-plugin-lane
 # own red check, not buried in the general test matrix. Zero tokens: all
 # upstreams are in-process mocks.
 on:
+  # #2637 plan #3: nightly full regression on master — daily backstop for
+  # the path filter below (schedule ignores paths).
+  schedule:
+    - cron: '30 16 * * *'
   pull_request:
     paths:
       - "src/server.ts"
@@ -20,7 +24,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: e2e-dsh-plugin-lane-${{ github.workflow }}-${{ github.ref }}
+  # #2637 plan #3: 'nightly' keeps scheduled runs out of the per-ref cancel scope.
+  group: e2e-dsh-plugin-lane-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
 
 jobs:

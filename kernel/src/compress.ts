@@ -30,7 +30,7 @@ import type { RenderStrategy } from "./render-refs.js";
 import {
   collectLatestProtected,
   collectProtectedToolCallIds,
-  hasMediaPayload,
+  hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
   isMessageProtected,
   isMessageProtectedWithPairing,
@@ -926,11 +926,13 @@ const assignRefsNode: PipelineNode = {
       hasProtection && hasPathPatterns
         ? collectProtectedToolCallIds(io.messages, ctx.config)
         : undefined;
-    // Media payloads (image/file sidecars) ride outside msg.text; folding one
-    // destroys it permanently (#1188), so media messages always get a BLOCKED
-    // ref — never advertised, never folded — regardless of tool-protection config.
+    // Unrecoverable media (remote URLs / file refs with no stored bytes) ride
+    // outside msg.text; folding one destroys it permanently with no restore
+    // behind it (#1188/#2609), so those messages get a BLOCKED ref — never
+    // advertised, never folded. Archivable inline images fold like text and
+    // stay citable by their numeric ref for decompress({ imageRef }) (#2607).
     const protectedFn = (m: CoreMessage) =>
-      hasMediaPayload(m) ||
+      hasUnrecoverableMediaPayload(m) ||
       (hasProtection
         ? (pathProtectedCallIds
             ? isMessageProtectedWithPairing(m, ctx.config, pathProtectedCallIds)
@@ -1347,11 +1349,11 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
 
   const mediaExcluded = directMessageIds.filter((id) => {
     const msg = input.messages.find((m) => m.id === id);
-    return !!msg && hasMediaPayload(msg);
+    return !!msg && hasUnrecoverableMediaPayload(msg);
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
-      `Excluded ${mediaExcluded.length} message(s) carrying image/attachment payload(s) from compression range — their bytes are unrecoverable once folded (billion-context#1188); enable stripImages to release old ones.`,
+      `Excluded ${mediaExcluded.length} message(s) carrying unrecoverable media (remote URL / file references with no stored bytes) from compression range — folding would destroy them permanently (billion-context#1188/#2609). Inline images fold normally and stay restorable via decompress({ imageRef }).`,
     );
   }
 
@@ -1647,7 +1649,7 @@ function filterProtectedToolMessages(
     const msg = messages.find((m) => m.id === id);
     if (!msg) continue;
     if (
-      hasMediaPayload(msg) ||
+      hasUnrecoverableMediaPayload(msg) ||
       isMessageProtected(msg, config) ||
       isMessageLatestProtected(msg, latest)
     ) {
