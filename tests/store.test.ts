@@ -331,7 +331,13 @@ test("#2674: successful content-store save leaves no .tmp-* orphans (temp + rena
     }
 });
 
-test("#2674: a failed content-store save leaves the previous envelope byte-identical and stays dirty", () => {
+// #2674: skipped on win32 — the forced failure below uses chmodSync(0o500),
+// which NTFS ignores (POSIX-only); node:fs has no portable EACCES primitive, so
+// the byte-identical assertion would flip there. Atomicity stays pinned on
+// Windows by the no-orphan / crashed-temp / boot-sweep pins.
+test("#2674: a failed content-store save leaves the previous envelope byte-identical and stays dirty", {
+    skip: process.platform === "win32" ? "chmod-based EACCES injection is POSIX-only (NTFS ignores mode bits), #2674" : false,
+}, () => {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-ccr-atomicfail-"));
     const logs: string[] = [];
     const store = new SessionStore({ dir, debounceMs: 60_000, log: (level, msg) => logs.push(`${level}:${msg}`) });
