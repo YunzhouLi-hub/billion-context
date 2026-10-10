@@ -355,6 +355,32 @@ export function dump4xxMaxBytes(): number {
     return Math.max(1024, n || 2 * 1024 * 1024);
 }
 
+/** BILI_DUMP_MAX_TOTAL_BYTES > diagnostics.maxTotalBytes > off (null). Total-size cap
+ *  for debug dump dirs (#2412); floor 1 MiB; 0/negative/non-numeric = off. */
+export function dumpGcMaxTotalBytes(): number | null {
+    const envRaw = process.env.BILI_DUMP_MAX_TOTAL_BYTES;
+    if (envRaw !== undefined) {
+        const v = Number(envRaw);
+        return Number.isFinite(v) && v > 0 ? Math.max(1 << 20, v) : null;
+    }
+    const f = fileDiag().maxTotalBytes;
+    if (typeof f === "number" && Number.isFinite(f) && f > 0) return Math.max(1 << 20, f);
+    return null;
+}
+
+/** BILI_DUMP_MAX_AGE_DAYS > diagnostics.maxAgeDays > off (null). Age cap for debug dump
+ *  dirs (#2412); floor 1 h; 0/negative/non-numeric = off. */
+export function dumpGcMaxAgeMs(): number | null {
+    const envRaw = process.env.BILI_DUMP_MAX_AGE_DAYS;
+    if (envRaw !== undefined) {
+        const d = Number(envRaw);
+        return Number.isFinite(d) && d > 0 ? Math.max(1 / 24, d) * 86_400_000 : null;
+    }
+    const f = fileDiag().maxAgeDays;
+    if (typeof f === "number" && Number.isFinite(f) && f > 0) return Math.max(1 / 24, f) * 86_400_000;
+    return null;
+}
+
 /** ACP_RENDER_NONE > diagnostics.renderNone > false (any non-empty env value enables). */
 export function renderNone(): boolean {
     const envRaw = process.env.ACP_RENDER_NONE;

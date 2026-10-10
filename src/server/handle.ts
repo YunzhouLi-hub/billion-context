@@ -23,6 +23,7 @@ import { storeEffectiveImageCompression, type ImageCompressionSettings } from ".
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
+import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, recordSignedRefusal, signedRefusal } from "../apig-resign.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "../thirdparty-scan.js";
@@ -1986,6 +1987,7 @@ export async function handle(
                         );
                         const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
                         fs.writeFileSync(path.join(rawDir, `${Date.now()}-${safeSessionId(session.id)}-INCOMING.txt`), `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
+                        gcDumpDirIfConfigured(rawDir);
                     } catch (err) { logDumpFailure("INCOMING dump", err); }
                 }
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
