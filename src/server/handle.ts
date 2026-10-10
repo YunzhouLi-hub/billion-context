@@ -516,11 +516,7 @@ export async function handle(
             }
             if (routeKey === undefined && providerKeys.length > 0) warnRouteMissIfNew(diagOrigin, model, providerKeys, log);
             resolvedNativeWindow = native;
-            // #321 PR-E1: a codex client carries its OWN window perception
-            // (bundled model table + 272K unknown-model fallback) and
-            // auto-compacts at 90% of it. If bili's budget exceeds what codex
-            // believes, codex's native compaction fires first — the #292
-            // misalignment. Cap the effective window at codex's perception.
+            // 优先客户端声明及当前 Codex 缓存，再用发布时模型表对齐窗口，避免旧表误裁剪新模型。
             // An operator's explicit compress.modelContextLimit is exempt
             // (operator tuning is owned by the operator — never floored and
             // never clamped); the clamped value is authoritative for this
@@ -528,13 +524,13 @@ export async function handle(
             // low-confidence fallback flag.
             const aligned = operatorWindowTuned
                 ? { limit: reqConfig.modelContextLimit, clamped: false }
-                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, pluginWindow ?? runtimeWindow ?? launcherWindow);
             if (aligned.clamped) {
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
                 windowShrinkReason = "codex";
-                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (client-window alignment for model=${model}; current client metadata preferred over bundled fallback) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
                 windowShrinkReason = "operator";
             }

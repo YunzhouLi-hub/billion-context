@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 process.env.NODE_ENV = "test";
+const originalHome = process.env.CODEX_HOME;
+const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-snapshot-"));
+process.env.CODEX_HOME = codexHome;
+after(() => {
+    if (originalHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalHome;
+    fs.rmSync(codexHome, { recursive: true, force: true });
+});
 
 import {
     CODEX_FALLBACK_CONTEXT_WINDOW,

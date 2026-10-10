@@ -337,6 +337,18 @@ two small node scripts that do the work around the client:
 
 ## Codex (OpenAI Codex CLI)
 
+**Window alignment.** Client-reported plugin/runtime windows and launcher windows
+take precedence over the bundled Codex model table. Without a report, a local
+proxy reads `models_cache.json` and the base `config.toml` under its `CODEX_HOME`
+(default `~/.codex`); `model_context_window` is capped by the matching model's
+`max_context_window`, then reduced by `effective_context_window_percent` (Codex's
+default is 95). Cache changes are picked up on subsequent requests. Missing,
+unreadable or invalid metadata falls back to the bundled table and its existing
+272K unknown-model limit. For a remote proxy or a different client profile, pass
+the client's window through the existing launcher/runtime reporting mechanism
+or set the existing `compress.modelContextLimit`; the proxy's local cache is not
+evidence of another machine's configuration. Output headroom still applies.
+
 Codex is the one client a plugin install cannot make self-sufficient. The seam
 matrix explains why: claude has a `SessionStart` hook + managed settings block,
 zcode has a provider store whose `baseURL` can be rewritten — codex has neither.
