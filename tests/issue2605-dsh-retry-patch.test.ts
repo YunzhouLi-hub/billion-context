@@ -23,7 +23,10 @@ const RETRY_ROW_DSA =
     "- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n";
 
 test("#2605: dsh.bundle.patch.yml restates every default code + MALFORMED_RESPONSE on both DeepSeek routes", () => {
-    const bundle = fs.readFileSync(path.join(REPO_ROOT, "..", "dsh.bundle.patch.yml"), "utf8");
+    // #2631: normalize CRLF checkouts (Git-for-Windows autocrlf) before the
+    // byte-exact multi-line includes; .gitattributes pins eol=lf as the first
+    // line of defense, this protects checkouts that bypass it.
+    const bundle = fs.readFileSync(path.join(REPO_ROOT, "..", "dsh.bundle.patch.yml"), "utf8").replaceAll("\r\n", "\n");
     assert.ok(bundle.includes(COMPACT_ROW), "compaction-basic auto:false row must stay intact");
     assert.ok(bundle.includes(RETRY_ROW_DS), "llm-deepseek retry row missing or drifted");
     assert.ok(bundle.includes(RETRY_ROW_DSA), "llm-deepseek-account retry row missing or drifted");
