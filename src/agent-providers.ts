@@ -58,7 +58,7 @@ export function sanitizeAgentProviderField(value: string, max: number): string {
 /** Structural validation of ONE provider entry. Throws with a reason that
  *  names the entry; never inspects or echoes the key beyond shape
  *  (non-empty printable, sane length). */
-export function parseAgentProviderEntry(name: string, value: unknown): AgentProviderRecipe {
+function parseAgentProviderEntry(name: string, value: unknown): AgentProviderRecipe {
     if (!validSummaryCredentialName(name)) throw new Error(`Invalid provider name "${name}"`);
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Provider "${name}" must be an object`);
     const recipe = value as { baseUrl?: unknown; api?: unknown; apiKey?: unknown; models?: unknown };
