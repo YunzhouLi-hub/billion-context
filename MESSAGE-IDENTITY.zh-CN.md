@@ -70,7 +70,7 @@ bili 的应对遵循上文的失败模式公理:**不猜** old→new 配对(猜�
 
 机制:每个 reconcile pass 滚动写入 `foldPositions`——按位置的 `sha256-16`,输入 `role | toolName | canonical text`(JSON 形文本键排序紧凑化;散文保留原始字节;`toolCallId` 与 `contentType` 字面量被排除,因为它们恰是跨 codec 重编码的 token;**reasoning 仅按 role 指纹**——responses adapter 把 provider item id 投影为 core text,若参与哈希,每次 churn 的第一条 reasoning 就会断掉全部配对)。Pass 0 随后在 churn 区间内先头扫、后尾扫,**仅在指纹于对齐位置相等时**才把旧 covered id 认领到新对应物;首个失配即停,所以中点插入/删除会诚实地拒绝桥接。没有副本的会话(升级时点的全部存量)零成本:第一个稳态 pass 建立副本,*下一次*漂移即被位置认领——迁移免费,因为"认不出"本身就是新序列。
 
-这与下文否决「位置当 join key」并不矛盾:裸位置被否决,是因为在没有旧字节记忆的情况下,位置 claim 是**猜测**,以认错告终。副本把猜测变成对齐偏移处的**已验证等值**——同一公理上移一层:指纹失配 → 诚实的认不出(unmatched,走 #1001/#1195 lane),永不认错。验证矩阵在 `tests/identity-proof.test.ts`(机制级、judge 计费,仿 `tests/cache-proof.test.ts`):4 wire × 3 阶段(折叠稳定 → id 方案+序列化 churn 后覆盖保持 → 中点编辑诚实重入)、reconcile-off 对照(无该层时 churn 重新计费)、跨 wire 客户端互换(anthropic → chat)端到端保持覆盖。
+这与下文否决「位置当 join key」并不矛盾:裸位置被否决,是因为在没有旧字节记忆的情况下,位置 claim 是**猜测**,以认错告终。副本把猜测变成对齐偏移处的**已验证等值**——同一公理上移一层:指纹失配 → 诚实的认不出(unmatched,走 #1001/#1195 lane),永不认错。验证矩阵在 `tests/identity-proof.test.ts`(机制级、judge 计费,仿 `tests/cache-proof.test.ts`):4 wire × 3 阶段(折叠稳定 → id 方案+序列化 churn 后覆盖保持 → 中点编辑诚实重入)、reconcile-off 对照(无该层时 churn 重新计费)、跨 wire 客户端互换(anthropic → chat)端到端保持覆盖,以及切模型阶段(#2636):chat lane 携带 reasoning 助手轮与图片用户轮,随后把历史重放到另一个形状的模型(reasoning 内联 pair→merged、图片换占位行)——覆盖必须扛住形状 churn 且已覆盖的 thinking 不得重入,以 churn 后**第一个** body 为准(新的服务端 compress 可能把失败重放重新折回去——治愈后的 round-2 不得冒充保持证明),另有自己的 reconcile-off 对照证明无该层时此 churn 类会重新计费。
 
 ## hash 公理的已知代价——以及修复方向
 
@@ -105,4 +105,4 @@ DeepSeek 类网关要求客户端传回网关自己发出的 reasoning("the reas
 
 若未来宿主或 lane 提供真正稳定的客户端消息 id,只允许作为**附加 join hint** 采纳——永不替代 content-hash 基座。在那之前:字节是锚,hash 是 join,mNNNNN 是账本,标签是视图。
 
-相关:#1496(本文档的起因)、`SESSION-IDENTITY.zh-CN.md`(会话粒度)、#1476 + kernel #459/#463(回声判别)、#242/#1475(Responses id 约束)、#206/#673(标签回声)、#1479/#1482(strict-echo 修复)、#1039(工具调用字节不变量)、#2396(跨 provider 切换时宿主改写的工具调用 id)、#2480(位置折叠覆盖;`tests/identity-proof.test.ts` 是其证明矩阵)。
+相关:#1496(本文档的起因)、`SESSION-IDENTITY.zh-CN.md`(会话粒度)、#1476 + kernel #459/#463(回声判别)、#242/#1475(Responses id 约束)、#206/#673(标签回声)、#1479/#1482(strict-echo 修复)、#1039(工具调用字节不变量)、#2396(跨 provider 切换时宿主改写的工具调用 id)、#2480(位置折叠覆盖;`tests/identity-proof.test.ts` 是其证明矩阵)、#2636(切模型形状 churn:assistant-turn key + 图片占位变体 pass)。
