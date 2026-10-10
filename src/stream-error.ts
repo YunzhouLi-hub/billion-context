@@ -60,7 +60,7 @@ function nativeErrorChunk(protocol: Protocol, message: string): string {
  *  chunk lands in — `blockIndex` is the next free content-block index (the
  *  caller already forwarded that many blocks to the client), `messageStarted`
  *  whether the client already received the message_start that owns them. */
-export interface LegacyAnthropicState {
+interface LegacyAnthropicState {
     blockIndex?: number;
     messageStarted?: boolean;
 }
