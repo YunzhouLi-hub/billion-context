@@ -4,7 +4,7 @@ export function extractStringSet(src: string, varName: string): string[];
 export function extractConfigLeaves(configSrc: string): string[];
 export function extractCliFlags(cliSrc: string): string[];
 export function loadDocumentedKeys(): Set<string>;
-export interface ConfigSurfaceReport {
+interface ConfigSurfaceReport {
     leaves: string[];
     flags: string[];
     longFlags: string[];
