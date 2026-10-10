@@ -195,6 +195,20 @@ jobs:
           node-version: 22
       - run: node tools/gen-config-docs.mjs check-coverage
 
+  # #2643 config-surface guard: closes the two surfaces check-coverage above
+  # does not reach — nested config-file leaf fields (only top-level keys were
+  # enforced) and CLI --flags (never checked). An undocumented addition goes red
+  # here with the missing names listed. Zero-dep: plain node, no install step.
+  # Not gated to pull_request so master pushes are held to the same surface.
+  config-surface-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/config-surface-guard.mjs
+
   # #2170 lane guard: the side-lane decision (#388 passthrough — src/server/
   # side-request.ts + the lane region of src/server/handle.ts, extracted from
   # src/server.ts by #1440) is regression-critical
