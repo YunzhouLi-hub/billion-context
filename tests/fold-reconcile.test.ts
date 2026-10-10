@@ -15,6 +15,7 @@ import {
     type FoldBlockCoverage,
     type ReconcileOptions,
 } from "../src/fold-reconcile.ts";
+import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 
@@ -172,6 +173,32 @@ describe("planReconciliation (#1921)", () => {
         const plan = planReconciliation(oldOrder, anchors, [churned, oldMsgs[0], oldMsgs[2]], covered);
         assert.equal(plan.claims.get(u2), "u2-new");
         assert.equal(plan.unmatched.includes(u1), false);
+    });
+
+    // #2283 sub-defect 3 / #1921: expose a token estimate of the re-entering unfolded
+    // mass so the fold-rollback growth contribution is quantifiable offline.
+    test("clean resend leaves churn token fields unset (no drift path)", () => {
+        const plan = planReconciliation(oldOrder, anchors, oldMsgs, covered);
+        assert.equal(plan.churnTokens, undefined);
+        assert.equal(plan.claimedChurnTokens, undefined);
+    });
+
+    test("reanchored churn reports churn tokens equal to claimed tokens", () => {
+        const churnedText = "please analyze  module 2\r\n";
+        const churned = msg("u2-new", "user", churnedText);
+        const plan = planReconciliation(oldOrder, anchors, [oldMsgs[0], churned, oldMsgs[2]], covered);
+        assert.ok(typeof plan.churnTokens === "number" && typeof plan.claimedChurnTokens === "number");
+        assert.equal(plan.churnTokens, defaultCountTokens(churnedText));
+        assert.equal(plan.claimedChurnTokens, defaultCountTokens(churnedText), "claimed candidate is the only churn-region message");
+        assert.ok(plan.claimedChurnTokens! <= plan.churnTokens!, "claimed never exceeds total churn");
+    });
+
+    test("unmatched real edit reports full churn tokens and zero claimed", () => {
+        const editedText = "please analyze module 2X";
+        const edited = msg("u2-edited", "user", editedText);
+        const plan = planReconciliation(oldOrder, anchors, [oldMsgs[0], edited, oldMsgs[2]], covered);
+        assert.equal(plan.churnTokens, defaultCountTokens(editedText));
+        assert.equal(plan.claimedChurnTokens, 0, "nothing re-anchored -> no claimed mass");
     });
 });
 
