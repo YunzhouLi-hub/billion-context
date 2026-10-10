@@ -10,6 +10,7 @@ import {
     noteSystemPromptFingerprint,
     METADATA_FOLD_COVERAGE,
     resetNormalizedIdentityWork,
+    turnContexts,
     normalizedIdentityWorkCount,
     type FoldAnchor,
     type FoldBlockCoverage,
@@ -83,7 +84,7 @@ describe("planReconciliation (#1921)", () => {
         // u2's bytes churned (client re-serialization) -> new id, same words.
         const churned = msg("u2-new", "user", "please analyze  module 2\r\n");
         const plan = planReconciliation(oldOrder, anchors, [oldMsgs[0], churned, oldMsgs[2]], covered);
-        assert.equal(plan.claims.get(u2), "u2-new");
+        assert.deepEqual(plan.claims.get(u2), ["u2-new"]);
         assert.equal(plan.byNorm, 1);
         assert.equal(plan.unmatched.length, 0);
     });
@@ -100,7 +101,7 @@ describe("planReconciliation (#1921)", () => {
         const anchorsT = { t1: anchorOf(oldTool) };
         const churnedTool = msg("t1-new", "tool_result", '{"rows": [1, 2, 3]}', { toolCallId: "toolu_01ABC", toolName: "query" });
         const plan = planReconciliation(["t1"], anchorsT, [churnedTool], new Set(["t1"]));
-        assert.equal(plan.claims.get("t1"), "t1-new");
+        assert.deepEqual(plan.claims.get("t1"), ["t1-new"]);
         assert.equal(plan.byTool, 1);
     });
 
@@ -114,8 +115,8 @@ describe("planReconciliation (#1921)", () => {
                            msg("d3-new", "tool_result", "(no content)", { toolCallId: "call-d3" })];
         const plan = planReconciliation(["d1", "d2", "d3"], anchorsD, survivors, new Set(["d1", "d2", "d3"]));
         // tool anchors are authoritative: d2 -> d2-new, d3 -> d3-new, d1 (deleted) unmatched
-        assert.equal(plan.claims.get("d2"), "d2-new");
-        assert.equal(plan.claims.get("d3"), "d3-new");
+        assert.deepEqual(plan.claims.get("d2"), ["d2-new"]);
+        assert.deepEqual(plan.claims.get("d3"), ["d3-new"]);
         assert.deepEqual(plan.unmatched, ["d1"]);
     });
 
@@ -129,11 +130,11 @@ describe("planReconciliation (#1921)", () => {
         // k-th-to-k-th pairing: after deleting n2, the survivor n3 IS the 2nd
         // occurrence — its content (identical to n2) stays covered, and the
         // truly-deleted ordinal is the unmatched one.
-        assert.equal(plan.claims.get("n1"), "n1-new");
-        assert.equal(plan.claims.get("n2"), "n3-new");
+        assert.deepEqual(plan.claims.get("n1"), ["n1-new"]);
+        assert.deepEqual(plan.claims.get("n2"), ["n3-new"]);
         assert.deepEqual(plan.unmatched, ["n3"]);
         // both survivors end up covered: zero identical-content loss
-        const coveredNow = new Set(plan.claims.values());
+        const coveredNow = new Set([...plan.claims.values()].flat());
         assert.deepEqual([...coveredNow].sort(), ["n1-new", "n3-new"].sort());
     });
 
@@ -163,7 +164,7 @@ describe("planReconciliation (#1921)", () => {
         const anchorsL = { big: { n: normalizedIdentity(msg("big", "user", "hello world")), r: "user", b: 11 } };
         const incoming = [msg("big-new", "user", "hello world" + " ".repeat(200))];
         const plan = planReconciliation(["big"], anchorsL, incoming, new Set(["big"]));
-        assert.equal(plan.claims.get("big"), "big-new");
+        assert.deepEqual(plan.claims.get("big"), ["big-new"]);
         assert.equal(plan.byNorm, 1);
     });
 
@@ -171,7 +172,7 @@ describe("planReconciliation (#1921)", () => {
         // u2 churns AND u1 moves after it (reorder) — u1 is present, must not be claimed
         const churned = msg("u2-new", "user", "please analyze module 2");
         const plan = planReconciliation(oldOrder, anchors, [churned, oldMsgs[0], oldMsgs[2]], covered);
-        assert.equal(plan.claims.get(u2), "u2-new");
+        assert.deepEqual(plan.claims.get(u2), ["u2-new"]);
         assert.equal(plan.unmatched.includes(u1), false);
     });
 
@@ -657,7 +658,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -751,7 +752,7 @@ describe("rewrite-suspect detection (#2396)", () => {
         const churned = msg("tc1-new", "tool_result", "payload body  words\r\n", { toolCallId: "call_seed|fc_0", toolName: "probe" });
         const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [churned], new Set(["tc1"]));
         assert.equal(plan.byTool, 1);
-        assert.deepEqual([...plan.claims.entries()], [["tc1", "tc1-new"]]);
+        assert.deepEqual([...plan.claims.entries()], [["tc1", ["tc1-new"]]]);
         assert.equal(plan.idRewriteSuspects, 0);
     });
 
@@ -841,5 +842,244 @@ describe("rewrite-suspect detection (#2396)", () => {
             assert.equal(anchors[m.id!]?.m, normalizedIdentityNoToolCallId(m), "m backfilled from live bytes");
             assert.equal(anchors[m.id!]?.n, normalizedIdentity(m));
         }
+    });
+});
+
+describe("planReconciliation model-switch churn (#2636)", () => {
+    // anchors must carry the turn ctx (p/p2/x) the seeding path attaches —
+    // the turn-key pass is inert without it.
+    const anchorMap = (msgs: CoreMessage[]): Record<string, FoldAnchor> => {
+        const ctx = turnContexts(msgs);
+        const out: Record<string, FoldAnchor> = {};
+        for (const m of msgs) out[m.id!] = { ...anchorOf(m), ...ctx.get(m.id) } as FoldAnchor;
+        return out;
+    };
+
+    test("pair→merged: cross-model inline thinking re-anchors (seamed join)", () => {
+        const oldMsgs = [
+            msg("u1", "user", "question 1"),
+            msg("r1", "assistant", "thinking one", { contentType: "reasoning" }),
+            msg("t1", "assistant", "answer one"),
+            msg("u2", "user", "question 2"),
+            msg("r2", "assistant", "thinking two", { contentType: "reasoning" }),
+            msg("t2", "assistant", "answer two"),
+        ];
+        const newMsgs = [
+            msg("u1", "user", "question 1"),
+            msg("m1", "assistant", "thinking one\nanswer one"),
+            msg("u2", "user", "question 2"),
+            msg("m2", "assistant", "thinking two\nanswer two"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["r1", "t1", "r2", "t2"]));
+        assert.equal(plan.byTurn, 2);
+        assert.equal(plan.unmatched.length, 0);
+        assert.deepEqual(plan.claims.get("r1"), ["m1"]);
+        assert.deepEqual(plan.claims.get("t1"), ["m1"]);
+        assert.deepEqual(plan.claims.get("r2"), ["m2"]);
+        assert.deepEqual(plan.claims.get("t2"), ["m2"]);
+    });
+
+    test("pair→merged: seamless join (pi concatenates parts with \"\")", () => {
+        const oldMsgs = [
+            msg("r1", "assistant", "thinking one", { contentType: "reasoning" }),
+            msg("t1", "assistant", "answer one"),
+        ];
+        const newMsgs = [msg("m1", "assistant", "thinking oneanswer one")];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["r1", "t1"]));
+        assert.equal(plan.byTurn, 1);
+        assert.deepEqual(plan.claims.get("r1"), ["m1"]);
+        assert.deepEqual(plan.claims.get("t1"), ["m1"]);
+    });
+
+    test("thinking-only turn: contentType text↔reasoning flip re-anchors", () => {
+        const oldMsgs = [
+            msg("u1", "user", "question 1"),
+            msg("m1", "assistant", "pure thinking, no reply part"),
+            msg("u2", "user", "question 2"),
+        ];
+        const newMsgs = [
+            msg("u1", "user", "question 1"),
+            msg("r1", "assistant", "pure thinking, no reply part", { contentType: "reasoning" }),
+            msg("u2", "user", "question 2"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["m1"]));
+        assert.equal(plan.byTurn, 1);
+        assert.deepEqual(plan.claims.get("m1"), ["r1"]);
+        assert.equal(plan.unmatched.length, 0);
+    });
+
+    test("merged→pair: switch back onto a same-model wire splits the turn", () => {
+        const oldMsgs = [
+            msg("u1", "user", "question 1"),
+            msg("m1", "assistant", "thinking one\nanswer one"),
+            msg("u2", "user", "question 2"),
+        ];
+        const newMsgs = [
+            msg("u1", "user", "question 1"),
+            msg("r1", "assistant", "thinking one", { contentType: "reasoning" }),
+            msg("t1", "assistant", "answer one"),
+            msg("u2", "user", "question 2"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["m1"]));
+        assert.equal(plan.byTurn, 1);
+        assert.deepEqual(plan.claims.get("m1"), ["r1", "t1"]);
+        assert.equal(plan.unmatched.length, 0);
+    });
+
+    test("image-capability variant: placeholder appended on the text-only replay", () => {
+        const oldMsgs = [
+            msg("u1", "user", "see this diagram"),
+            msg("u2", "user", "next question"),
+        ];
+        const newMsgs = [
+            msg("p1", "user", "see this diagram\n(image omitted: model does not support images)"),
+            msg("u2", "user", "next question"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["u1"]));
+        assert.equal(plan.byImage, 1);
+        assert.deepEqual(plan.claims.get("u1"), ["p1"]);
+        assert.equal(plan.unmatched.length, 0);
+    });
+
+    test("image-capability variant: placeholder stripped on the vision replay", () => {
+        const oldMsgs = [
+            msg("p1", "user", "see this diagram\n(image omitted: model does not support images)"),
+            msg("u2", "user", "next question"),
+        ];
+        const newMsgs = [
+            msg("u1", "user", "see this diagram"),
+            msg("u2", "user", "next question"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["p1"]));
+        assert.equal(plan.byImage, 1);
+        assert.deepEqual(plan.claims.get("p1"), ["u1"]);
+        assert.equal(plan.unmatched.length, 0);
+    });
+
+    test("image family: identical texts pair k-th when counts match", () => {
+        const wrap = (id: string): CoreMessage => msg(id, "user", "Attached image(s) from tool result:\n");
+        const oldMsgs = [wrap("o1"), wrap("o2"), msg("u9", "user", "tail")];
+        const newMsgs = [
+            msg("p1", "user", "Attached image(s) from tool result:\n\n(image omitted: model does not support images)"),
+            msg("p2", "user", "Attached image(s) from tool result:\n\n(image omitted: model does not support images)"),
+            msg("u9", "user", "tail"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["o1", "o2"]));
+        assert.equal(plan.byImage, 2);
+        assert.deepEqual(plan.claims.get("o1"), ["p1"]);
+        assert.deepEqual(plan.claims.get("o2"), ["p2"]);
+        assert.equal(plan.unmatched.length, 0);
+    });
+
+    test("duplicated turns stay unmatched (never fuzzy)", () => {
+        const turn = (k: string): CoreMessage[] => [
+            msg(`r${k}`, "assistant", "same thinking", { contentType: "reasoning" }),
+            msg(`t${k}`, "assistant", "same answer"),
+        ];
+        const oldMsgs = [...turn("1"), ...turn("2")];
+        const newMsgs = [
+            msg("m1", "assistant", "same thinking\nsame answer"),
+            msg("m2", "assistant", "same thinking\nsame answer"),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["r1", "t1", "r2", "t2"]));
+        assert.equal(plan.byTurn, 0);
+        assert.equal(plan.claims.size, 0);
+        assert.equal(plan.unmatched.length, 4);
+    });
+
+    test("length guard rejects a turn-key witness of wildly different size", () => {
+        const oldMsgs = [
+            msg("r1", "assistant", "short thinking", { contentType: "reasoning" }),
+            msg("t1", "assistant", "short answer"),
+        ];
+        const newMsgs = [msg("m1", "assistant", `short thinking\nshort answer${" noise".repeat(400)}`)];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["r1", "t1"]));
+        assert.equal(plan.byTurn, 0);
+        assert.equal(plan.unmatched.length, 2);
+    });
+
+    test("length guard rejects an image-variant witness of wildly different size", () => {
+        const oldMsgs = [msg("u1", "user", "see this")];
+        const newMsgs = [
+            msg("p1", "user", `see this${" noise".repeat(400)}\n(image omitted: model does not support images)`),
+        ];
+        const plan = planReconciliation(oldMsgs.map((m) => m.id!), anchorMap(oldMsgs), newMsgs, new Set(["u1"]));
+        assert.equal(plan.byImage, 0);
+        assert.equal(plan.unmatched.length, 1);
+    });
+});
+
+describe("reconcileFoldCoverage model-switch churn (#2636)", () => {
+    function fakeSession(blocks: { effectiveMessageIds: string[]; directMessageIds?: string[] }[]): Session {
+        return {
+            state: { blocks: blocks.map((b) => ({ active: true, ...b })) },
+            metadata: {},
+        } as unknown as Session;
+    }
+    const opts = (): ReconcileOptions => ({ mode: "repair", sessionId: "s1", log: () => {} });
+
+    test("pair→merged rewrite collapses the covered pair onto one id (no duplicates)", () => {
+        const originals = [
+            msg("u0", "user", "ctx 0"),
+            msg("u1", "user", "ctx 1"),
+            msg("r1", "assistant", "thinking about the problem at length", { contentType: "reasoning" }),
+            msg("t1", "assistant", "the answer is 42 with details"),
+            msg("u2", "user", "ctx 2"),
+            msg("r2", "assistant", "more thinking here", { contentType: "reasoning" }),
+            msg("t2", "assistant", "second answer"),
+            msg("u3", "user", "ctx 3"),
+            msg("r3", "assistant", "third thinking", { contentType: "reasoning" }),
+            msg("t3", "assistant", "third answer"),
+            msg("u4", "user", "ctx 4"),
+        ];
+        const covered = ["r1", "t1", "r2", "t2", "r3", "t3"];
+        const session = fakeSession([{ effectiveMessageIds: covered, directMessageIds: covered }]);
+        reconcileFoldCoverage(session, originals, opts());
+        const churned = [
+            msg("u0", "user", "ctx 0"),
+            msg("u1", "user", "ctx 1"),
+            msg("m1", "assistant", "thinking about the problem at length\nthe answer is 42 with details"),
+            msg("u2", "user", "ctx 2"),
+            msg("m2", "assistant", "more thinking here\nsecond answer"),
+            msg("u3", "user", "ctx 3"),
+            msg("m3", "assistant", "third thinking\nthird answer"),
+            msg("u4", "user", "ctx 4"),
+            msg("u5", "user", "ctx 5"),
+            msg("u6", "user", "ctx 6"),
+        ];
+        const result = reconcileFoldCoverage(session, churned, opts());
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.byTurn, 3);
+        assert.equal(result.unmatched, 0);
+        assert.deepEqual(session.state.blocks[0].effectiveMessageIds, ["m1", "m2", "m3"]);
+        assert.deepEqual(session.state.blocks[0].directMessageIds, ["m1", "m2", "m3"]);
+        // anchors for the merged cores carry the turn ctx so the NEXT churn
+        // (e.g. switching back) still matches
+        const anchors = session.metadata.foldAnchors as Record<string, FoldAnchor>;
+        assert.ok(anchors["m1"]?.p !== undefined, "merged anchor carries turn key");
+        assert.deepEqual(
+            (session.state as { lastPassIds?: string[] }).lastPassIds?.sort(),
+            ["m1", "m2", "m3"],
+        );
+    });
+
+    test("model-switch churn no longer escalates to substrate-destroyed while some anchors recover", () => {
+        const originals = Array.from({ length: 12 }, (_, i) =>
+            i % 2 === 0
+                ? msg(`u${i}`, "user", `stable user text ${i}`)
+                : msg(`a${i}`, "assistant", `stable assistant answer ${i}`));
+        const covered = originals.map((m) => m.id!);
+        const session = fakeSession([{ effectiveMessageIds: covered }]);
+        const logs: { level: string; msg: string }[] = [];
+        const logOpts = { mode: "repair" as const, sessionId: "s1", log: (level: string, message: string) => logs.push({ level, msg: message }) };
+        reconcileFoldCoverage(session, originals, logOpts);
+        // churn: model switch rewrites every covered id but ALL re-anchor
+        const churned = originals.map((m, i) => msg(`n${i}`, m.role, `${m.text} `));
+        const result = reconcileFoldCoverage(session, churned, logOpts);
+        assert.equal(result.kind, "reanchored");
+        assert.equal(result.unmatched, 0);
+        // no escalation possible: drift streak requires zero claims (#2193)
+        assert.equal(session.metadata.foldDriftStreak, undefined);
+        assert.equal(logs.filter((l) => l.level === "error").length, 0);
     });
 });
