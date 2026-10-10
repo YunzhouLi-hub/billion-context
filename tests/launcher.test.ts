@@ -3582,7 +3582,9 @@ test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home
         const txt = fs.readFileSync(file, "utf8");
         assert.ok(txt.startsWith("- insert:\n"));
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: file:\/\/.+dsh-native\.js$/m);
-        assert.match(txt, /^- id: compaction-basic\n  config:\n    auto: false\n$/m);
+        assert.match(txt, /^- id: compaction-basic\n  config:\n    auto: false\n/m);
+        assert.match(txt, /^- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n/m);
+        assert.match(txt, /^- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: \[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE\]\n$/m);
         rmrf(`${dir}-bili`);
     } finally {
         rmrf(dir);
