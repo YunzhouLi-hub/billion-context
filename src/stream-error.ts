@@ -115,7 +115,7 @@ function legacyCompletionChunk(protocol: Protocol, visible: string, state?: Lega
 }
 
 export function emitStreamError(res: http.ServerResponse, protocol: Protocol, message: string, log?: (msg: string) => void, errorShape: "protocol" | "completion" = "protocol", state?: LegacyAnthropicState): void {
-    const visible = `\n❌ [ACP] stream error: ${message}`;
+    const visible = `\n\u274C [ACP] stream error: ${message}`;
     log?.(`[acp-proxy: stream aborted mid-response: ${message}]`);
     const chunk = errorShape === "protocol"
         ? nativeErrorChunk(protocol, `[acp-proxy: ${message}]`)
