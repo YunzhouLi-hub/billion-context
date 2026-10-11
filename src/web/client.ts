@@ -101,7 +101,7 @@ export const WEB_CLIENT = `(function () {
         const displayOnlyN = Math.max(0, Math.min(typeof c.displayOnly === "number" ? c.displayOnly : 0, pluginN - siblingN));
         const suspectedN = Math.max(0, Math.min(typeof c.suspected === "number" ? c.suspected : 0, pluginN - siblingN - displayOnlyN));
         const confirmedTpN = Math.max(0, pluginN - siblingN - displayOnlyN - suspectedN);
-        const confirmedNativeN = kinds["native-compaction"] || 0;
+        const confirmedNativeN = (kinds["native-compaction"] || 0) + (kinds["native-compaction-inferred"] || 0); // #2709: inferred landings share the confirmed-native remediation tier
         const signalN = Math.max(0, c.events - pluginN - confirmedNativeN);
         const whatParts = [];
         if (confirmedTpN > 0) whatParts.push(t("conflict.what_plugin"));

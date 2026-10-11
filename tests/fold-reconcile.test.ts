@@ -20,6 +20,7 @@ import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { conflictEventsOf } from "../src/conflict-watch.js";
 
 function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage>): CoreMessage {
     return { id, role, contentType: "text", text, ...extra } as CoreMessage;
@@ -401,6 +402,62 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         assert.equal(errorLines(logs).length, 0, "stale streak must not pull escalation forward");
         reconcileFoldCoverage(session, freshPass("q4"), opts);
         assert.equal(errorLines(logs).length, 1, "fresh episode escalates on its own third pass");
+    });
+
+    // #2709: at the destruction point the refusal-ledger witness turns the
+    // escalation into a ledger action — but ONLY when witnessed (dsh-bound +
+    // non-zero dshCompactionRefusals). One event per episode: the ESCALATED
+    // latch guards re-entry.
+    function driftSession(metadata: Record<string, unknown>): Session {
+        const ids = Array.from({ length: 12 }, (_, i) => `c${i}`);
+        return {
+            id: "drift",
+            state: { blocks: [{ active: true, blockId: "blk-d", effectiveMessageIds: ids }], messageRefs: { byRaw: {}, byRef: {} } },
+            metadata,
+        } as unknown as Session;
+    }
+    const driftOriginals = () => Array.from({ length: 12 }, (_, i) => msg(`c${i}`, "user", `covered text ${i} with enough words`));
+
+    test("#2709 witnessed dsh total-loss drift records exactly one native-compaction-inferred event", () => {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        const session = driftSession({ pluginAgent: "dsh", dshCompactionRefusals: 17 });
+        const logs: LogLine[] = [];
+        const opts = makeOpts(logs);
+        reconcileFoldCoverage(session, driftOriginals(), opts);
+        assert.equal(conflictEventsOf(session).length, 0, "clean pass records nothing");
+        for (let pass = 1; pass <= 5; pass++) {
+            reconcileFoldCoverage(session, freshPass(`p${pass}`), opts);
+        }
+        const inferred = conflictEventsOf(session).filter((e) => e.kind === "native-compaction-inferred");
+        assert.equal(inferred.length, 1, "exactly ONE inferred event for the whole episode (ESCALATED latch)");
+        assert.match(inferred[0].detail, /refused 17 client-native compaction call\(s\)/);
+        assert.match(inferred[0].detail, /\[inferred\]/);
+        assert.match(inferred[0].detail, /#2193\/#2709/);
+        assert.equal(conflictEventsOf(session).filter((e) => e.kind === "unannounced-rewrite").length, 0, "no double-record beside the inferred entry");
+        assert.equal(errorLines(logs).length, 1, "the escalation error still fires exactly once");
+    });
+
+    test("#2709 unwitnessed drift never infers — false-positive guard", () => {
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        const variants: Record<string, unknown>[] = [
+            {},
+            { pluginAgent: "dsh" },
+            { pluginAgent: "dsh", dshCompactionRefusals: 0 },
+            { pluginAgent: "pi", dshCompactionRefusals: 5 },
+        ];
+        for (const metadata of variants) {
+            const session = driftSession(metadata);
+            const opts = makeOpts([]);
+            reconcileFoldCoverage(session, driftOriginals(), opts);
+            for (let pass = 1; pass <= 3; pass++) {
+                reconcileFoldCoverage(session, freshPass(`u${pass}`), opts);
+            }
+            assert.equal(
+                conflictEventsOf(session).filter((e) => e.kind === "native-compaction-inferred").length,
+                0,
+                `no inference without the witness (${JSON.stringify(metadata)})`,
+            );
+        }
     });
 });
 

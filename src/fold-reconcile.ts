@@ -98,7 +98,7 @@ import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
-import { recordConflict } from "./conflict-watch.js";
+import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -1217,6 +1217,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         if (streak >= FOLD_DRIFT_ESCALATE_PASSES && plan.unmatched.length >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             session.metadata[METADATA_DRIFT_ESCALATED] = true;
+            // #2709: take a ledger action at the destruction point (not just log) — attribute
+            // framing-absent total-loss drift to client-native compaction when witnessed. One
+            // event per episode: the ESCALATED latch above guards re-entry.
+            const dshWitness = dshNativeCompactionWitness(session);
+            if (dshWitness !== undefined) {
+                recordConflict(session, "native-compaction-inferred", `compression substrate destroyed (total-loss drift, no checkpoint marker); bili refused ${dshWitness} client-native compaction call(s) this session (#1729/#2028) — attributed to client-native compaction [inferred] (${plan.unmatched.length} covered id(s) missing, #2193/#2709)`);
+            }
             const since = session.metadata[METADATA_DRIFT_SINCE] as number | undefined;
             const span = typeof since === "number" ? `, ${Math.max(1, Math.round((Date.now() - since) / 60000))} min so far` : "";
             if (opts.log !== undefined) {

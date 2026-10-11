@@ -13,7 +13,7 @@ import { markDirty, type Session } from "./session.js";
 import { isCodexClient } from "./codex-compact.js";
 import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "./thirdparty-scan.js";
 
-type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction" | "native-compaction-inferred";
 
 export interface ConflictEvent {
     at: number;
@@ -54,6 +54,26 @@ export function recordConflict(session: Session, kind: ConflictKind, detail: str
     while (events.length > CONFLICT_LEDGER_MAX) events.shift();
     session.metadata.conflictEvents = events;
     markDirty(session);
+}
+
+// #2709: a framing-absent host-native compaction landing leaves no checkpoint
+// marker for carriesDshLocalCompactionSummary to catch, so the #1001/#2193
+// detectors classify it as a generic unannounced rewrite and the banner sends
+// the user hunting for a phantom second compressor. bili already WITNESSES such
+// landings indirectly: while the client kept calling bili's proxy for compaction,
+// bili refused those calls (#1729/#2028) and counted them in
+// metadata.dshCompactionRefusals (src/server/handle.ts). A dsh-bound session with a
+// non-zero refusal count plus a detected bulk rewrite is therefore attributable to
+// client-native compaction — not a foreign plugin — even without the marker.
+// Attribution ONLY: without the marker bili cannot identify the checkpoint, so it
+// must NOT rebase onto a guessed view (rebase stays gated on the framed detector).
+// Returns the refusal count when the inference holds, else undefined (caller keeps
+// the existing unannounced-rewrite classification).
+export function dshNativeCompactionWitness(session: Session): number | undefined {
+    const md = session.metadata;
+    if (!md || md.pluginAgent !== "dsh") return undefined;
+    const n = md["dshCompactionRefusals"];
+    return typeof n === "number" && n > 0 ? n : undefined;
 }
 
 // #2219: resolve which CLIENT a conflicting session belongs to, so the conflict
@@ -122,7 +142,10 @@ function isNeutralEvent(e: ConflictEvent): boolean {
 }
 
 function isConfirmedConflictEvent(e: ConflictEvent): boolean {
-    if (e.kind === "native-compaction") return true;
+    // #2709: an attributed (inferred) native-compaction landing is confirmed enough to
+    // stop the "hunt for a second compressor" errand — same remediation tier as a
+    // marker-detected landing; only the evidence differs (refusal ledger, not framing).
+    if (e.kind === "native-compaction" || e.kind === "native-compaction-inferred") return true;
     if (e.kind !== "third-party-plugin") return false;
     return !isNeutralEvent(e) && !isSuspectedEvent(e);
 }
@@ -138,7 +161,10 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     const meaningful = events.filter((e) => !isNeutralEvent(e));
     const confirmed = meaningful.filter(isConfirmedConflictEvent);
     const foreignConfirmed = confirmed.some((e) => e.kind === "third-party-plugin");
-    const nativePresent = confirmed.some((e) => e.kind === "native-compaction");
+    // #2709: a marker-detected landing can be rebased onto; an attribution-only
+    // (inferred) landing cannot — the advice below must say which one happened.
+    const confirmedNative = confirmed.some((e) => e.kind === "native-compaction");
+    const nativePresent = confirmedNative || confirmed.some((e) => e.kind === "native-compaction-inferred");
     const signals = meaningful.filter((e) => e.kind === "unannounced-rewrite" || e.kind === "orphan-reap");
     const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
     lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
@@ -173,7 +199,11 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         // and disable another plugin sends it on a useless errand (the incident
         // model did exactly that). Only foreign CONFIRMED third-party events keep
         // the one-compressor command; suspected names never do (#1736 tiering).
-        advice = "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation.";
+        // #2709: an INFERRED landing has no checkpoint marker, so bili could NOT
+        // rebuild the fold base — say that precisely instead of promising a rebuild.
+        advice = confirmedNative
+            ? "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili detects such landings and rebuilds the fold state onto them where possible (#2373/#2432); if compress still fails afterwards, this session's fold base is gone — start a fresh conversation."
+            : "The events above point at the client's OWN native compaction landing (host-side), not a third-party plugin — do not go hunting for a second plugin to disable. bili attributed this from its own witness (it refused the client's compaction calls this session) but did NOT see the checkpoint marker, so it could not rebuild the fold base onto the compacted view — this session's fold base is gone; start a fresh conversation.";
     } else if (signals.length === 0) {
         advice = active.length > 0
             ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
