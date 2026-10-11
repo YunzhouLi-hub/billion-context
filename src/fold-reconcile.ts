@@ -97,6 +97,7 @@
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
+import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { recordConflict } from "./conflict-watch.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
@@ -495,15 +496,11 @@ interface BlockLike {
  *  (consumed into a newer fold, host-expanded, or drifted out of the resent
  *  history) by setting active=false while KEEPING its effectiveMessageIds —
  *  those dead-lineage ids can never re-anchor and would sit in `missing`
- *  permanently, inflating the drift warn ~2x (#2293). Same caliber as the
- *  #1195 pre-turn snapshot. */
+ *  permanently, inflating the drift warn ~2x (#2293). Delegates to
+ *  coveredRealHistoryIds so the single real-history caliber (#2627) is
+ *  implemented exactly once. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
-    const covered = new Set<string>();
-    for (const block of blocks) {
-        if (!block.active) continue;
-        for (const id of block.effectiveMessageIds ?? []) covered.add(id);
-    }
-    return covered;
+    return coveredRealHistoryIds(blocks);
 }
 
 /** Pure core: plan the reconciliation between the previous pass order and the
@@ -1097,7 +1094,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     for (const block of blocks) {
         const bid = block.blockId;
         if (bid === undefined || bid === "") continue;
-        const ids = block.effectiveMessageIds ?? [];
+        // #2627: evidence counts REAL history only — separator ids can never
+        // be present or claimed, so including them in `t` would stall the
+        // ledger's p+r>=t accrual for polluted blocks forever.
+        const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
         if (ids.length === 0) continue;
         let p = 0, r = 0;
         for (const id of ids) {

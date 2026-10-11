@@ -9,7 +9,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { recordConflict } from "../conflict-watch.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
@@ -129,7 +129,7 @@ export async function prepareGoogle(
         // detection runs BEFORE reconcileFoldCoverage/processTurn. No known
         // dsh+google traffic yet — this closes the same hole on the fourth wire.
         if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
-            const coveredBeforeDshCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
+            const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
                 const missing = dshGap.expected - dshGap.matched;
@@ -149,7 +149,7 @@ export async function prepareGoogle(
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
-            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            ? coveredRealHistoryIds(session.state.blocks)
             : null;
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
