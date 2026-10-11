@@ -549,7 +549,34 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> }; registeredTools?: ManifestTool[] };
+
+// #2708: pi rebuilds its executable tool list per request — _refreshToolRegistry() walks
+// the live extension instances' tool maps into _toolRegistry, and setActiveToolsByName()
+// filters the active names through _toolRegistry.has(name), silently dropping any name it
+// no longer holds. If that rebuild runs while our instance's map is empty (a runtime
+// replacement / reload mid-session), the ACP tools leave the registry + active set while the
+// transcript keeps declaring them — the model then calls tools pi rejects by name forever,
+// and the once-per-sid gate below would never re-register them. Self-heal by probing the
+// host's real registry and re-asserting vanished tools: registerTool is idempotent (dedup by
+// name) and post-bind triggers a registry refresh, so a per-request re-assert is cheap and
+// safe. No registry query (older pi / omp) or a throwing query → no-op, never a blind re-register.
+function reassertDroppedTools(pi: ExtensionAPI, state: RegisterState, agent: string, proxyBase: string): void {
+    const tools = state.registeredTools;
+    if (tools === undefined || tools.length === 0) return;
+    const probe = (pi as { getAllTools?: () => Array<{ name?: unknown }> }).getAllTools;
+    if (typeof probe !== "function") return;
+    let present: Set<string>;
+    try {
+        present = new Set(probe.call(pi).map((t) => (typeof t?.name === "string" ? t.name : "")).filter((n): n is string => n.length > 0));
+    } catch {
+        return; // query rejected (e.g. stale ctx) — never re-register blindly
+    }
+    const missing = tools.map((t) => t.name).filter((name) => !present.has(name));
+    if (missing.length === 0) return;
+    console.warn(`bili-plugin(${agent}): ${missing.length} bili tool(s) dropped from the host registry (${missing.join(", ")}) — re-registering (#2708)`);
+    for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+}
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string, awaitNativeOrigin = true): Promise<void> {
     let proxyBase = proxyBaseForCtx(ctx);
@@ -559,7 +586,12 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     // so a successful registration is not re-fetched on every provider
     // request — the manifest is session-independent anyway.
     const sid = sessionIdOf(ctx) ?? "";
-    if (sid === state.sid) return;
+    if (sid === state.sid) {
+        // #2708: already registered for this sid — but pi may have rebuilt its
+        // registry since and dropped our tools. Re-assert if they vanished.
+        reassertDroppedTools(pi, state, agent, proxyBase);
+        return;
+    }
     if (state.pending !== undefined) return state.pending;
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
     const wait = state.retryIntervalMs;
@@ -588,6 +620,9 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             if (state.toolsFor !== sid) {
                 for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
                 state.toolsFor = sid;
+                // #2708: remember what we put in the host registry so the
+                // per-request re-assert can detect a later drop.
+                state.registeredTools = tools;
             }
             state.toolsReady = true;
             state.retryAt = undefined;
@@ -618,6 +653,10 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                 }
             }
             state.sid = sid;
+            // #2708: a same-id session_start skips the register loop above
+            // (toolsFor already === sid), so re-assert here too — otherwise a
+            // drop during that window wouldn't heal until the next request.
+            reassertDroppedTools(pi, state, agent, proxyBase);
         } catch (err) {
             state.sid = undefined;
             state.toolsFor = undefined;
