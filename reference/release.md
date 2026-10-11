@@ -35,6 +35,13 @@ The Agent does steps 1–6, the human does step 7 (merge).
    -    "version": "0.1.16",
    +    "version": "0.1.17",
    ```
+   Then regenerate the lock so its root + `file:`-link version fields track the
+   bump — editing `package.json` alone does NOT touch `package-lock.json` (#2704):
+   ```bash
+   npm install --package-lock-only --ignore-scripts --no-fund --no-audit
+   git diff --exit-code -- package-lock.json   # must be clean before you commit
+   ```
+   CI enforces this with the `lock-sync` guard (`ci.yml`).
 4. **Add the release-notes entry — ONLY for severe releases (#1870, opt-in
    since 2026-10-04)** — ordinary releases skip this step entirely and ship
    with NO entry. When a release IS severe, add the entry in the SAME release
@@ -199,7 +206,9 @@ When accumulated kernel changes warrant a standalone npm release of `acp-kernel`
 
 1. Branch `YYYY-MM-DD_release-kernel-v{VERSION}` off master.
 2. ONE commit `release kernel v{VERSION}` changing ONLY the version in
-   `kernel/package.json`.
+   `kernel/package.json` (then regenerate the root `package-lock.json` so
+   `packages.kernel.version` tracks it — same command as step 3 above; enforced by
+   the `lock-sync` guard, #2704).
 3. Open a PR (its body serves as the release notes; no release-notes entry required).
    HUMAN merges.
 4. `.github/workflows/release-kernel.yml` runs on the merge: full bili gate

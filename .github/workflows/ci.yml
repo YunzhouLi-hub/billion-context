@@ -38,7 +38,7 @@ jobs:
   # skip on push/dispatch (skipped needs count as satisfied). Behavior change:
   # on guard failure the required legs show pending (not red); merge blocked.
   test:
-    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports]
+    needs: [version-guard, kernel-guard, pi-subagents-guard, lane-guard, docs-sync, docs-coverage, unused-exports, lock-sync]
     strategy:
       fail-fast: false
       matrix:
@@ -271,3 +271,23 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/check-unused-exports.mjs
+
+  # #2704 drift guard: package-lock.json must track the version fields of the
+  # package.json files it records (root bili + the in-repo file: links
+  # kernel/, pi-subagents/). Bumping package.json does NOT regenerate the lock —
+  # only `npm install` does — so a bump that skips regen leaves it stale
+  # (#2704: root 0.1.190 vs 0.1.191, kernel 0.0.112 vs 0.0.114); regenerate and
+  # fail on any residual diff (idempotent when already synced). Deliberately NOT
+  # gated to pull_request (unlike version-guard/kernel-guard) so master pushes
+  # and release-branch bumps are held to it too — mechanical enforcement of
+  # AGENTS.md §4 rule 2 ("release commit changes ONLY version + lock if drifts").
+  lock-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --package-lock-only --ignore-scripts --no-fund --no-audit
+      - name: Fail on lockfile version drift
+        run: git diff --exit-code -- package-lock.json
