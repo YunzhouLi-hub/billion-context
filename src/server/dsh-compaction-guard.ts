@@ -147,30 +147,52 @@ export const DSH_CHECKPOINT_PREAMBLE_PREFIX =
 // missing ids are ordinary drift (edit/truncate), not a region replacement.
 export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
 
-/** True when a resent core message carries dsh checkpoint framing (preamble
- *  at message start, or the open tag anywhere — the tag sits mid-message after
- *  preamble + blank line). Used by the prepare-openai detector (#2432) to tell
- *  a landed native compaction apart from ordinary history churn. Reads the
- *  core-flattened text first (BiliMessage/CoreMessage carry prose in `.text`),
- *  falling back to a raw wire content field for direct callers.
+/** True when a freshly-LANDED dsh checkpoint is present in the resent history.
+ *  Used by the prepare-openai / prepare-responses detectors (#2432) to tell a
+ *  landed native compaction apart from ordinary history churn.
  *
- *  #2621 producer gate: a LANDED checkpoint is dsh-compaction-basic replacing
- *  exactly one user/message with plain text, so only a role=user TEXT message
- *  can carry real framing. Quotes from every other producer — assistant prose,
- *  reasoning, tool results, tool-call arguments, bili's own compress summaries
- *  echoed back in resent history — must NOT fire the detector: with the old
- *  any-message scan, "history mentions the tag" + "ordinary fold drift" was
- *  enough to rebase ACP state with no host compaction in sight, and the
- *  longest sessions (lowest kept ratio) were the most exposed. The
- *  contentType check is load-bearing on its own: anthropic-lane tool results
- *  flatten to role=user with contentType "tool-result". A role-less or
- *  non-user caller shape now reads false — the safe degradation direction
- *  this file pins everywhere (a miss rides the #2432 unannounced-rewrite
- *  archive path; a false positive resets live fold state). */
-export function carriesDshLocalCompactionSummary(msgs: readonly { text?: unknown; content?: unknown; role?: unknown; contentType?: unknown }[]): boolean {
+ *  A LANDED checkpoint is specifically ONE user-role, plain-text message
+ *  (dsh-compaction-basic replaces the shadowed region with a single
+ *  user/message whose text starts with CHECKPOINT_PREAMBLE). The framing bytes
+ *  are matched as before (open tag anywhere — it sits mid-message after
+ *  preamble + blank line; or the preamble at message start). But #2621 taught
+ *  that matching the framing BYTES ALONE is a false-positive machine: the
+ *  string survives anywhere history QUOTES it — a tool result that read a
+ *  transcript containing it, the model citing it in reasoning, bili's own
+ *  compress summaries quoting it, an assistant message paraphrasing the
+ *  preamble. Those carriers are structurally incapable of being a checkpoint,
+ *  so two gates tighten the match to "a checkpoint just landed":
+ *
+ *   ① CARRIER — the message must be role="user" AND plain text
+ *      (contentType "text" when typed). Tool results, reasoning blocks,
+ *      tool-call arguments, and assistant prose are excluded outright. On the
+ *      Anthropic lane a tool_result rides inside a wire role:"user" message but
+ *      flattens to role="tool"/contentType="tool-result" (kernel
+ *      anthropicToCore), so the role gate alone already drops it; the
+ *      contentType gate is kept as belt-and-suspenders for any lane that maps
+ *      a structured user block to a non-text contentType.
+ *   ② NOVELTY — the message's raw id must NOT already be in the pre-turn ref
+ *      map (`knownIds`, = Object.keys(session.state.messageRefs.byRaw) taken
+ *      BEFORE processTurn). A freshly-landed checkpoint is by definition a NEW
+ *      message; a historical quote/replay hits an OLD id. This closes the
+ *      residual of ①: a user who literally typed/pasted the framing into a
+ *      user message in an EARLIER turn is replayed as an old id, not a landing.
+ *
+ *  Reads the core-flattened text first (BiliMessage/CoreMessage carry prose in
+ *  `.text`), falling back to a raw wire content field for direct callers. When
+ *  `knownIds` is omitted the novelty gate is skipped (carrier gate only) —
+ *  every in-repo caller passes it. */
+export function carriesDshLocalCompactionSummary(
+    msgs: readonly { id?: unknown; role?: unknown; contentType?: unknown; text?: unknown; content?: unknown }[],
+    knownIds?: ReadonlySet<string>,
+): boolean {
     for (const m of msgs) {
-        if (m.role !== "user") continue;
-        if (m.contentType !== undefined && m.contentType !== "text") continue;
+        // ① CARRIER (#2621): only a user-role plain-text message can be a
+        // checkpoint. Exclude every other producer of the marker string.
+        if (m.role !== "user" || (m.contentType !== undefined && m.contentType !== "text")) continue;
+        // ② NOVELTY (#2621): a freshly-landed checkpoint is a NEW id; a quoted
+        // or replayed mention is an old id already in the pre-turn ref map.
+        if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
         if (text === "") continue;
         if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;

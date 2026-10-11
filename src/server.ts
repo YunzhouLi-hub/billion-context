@@ -6,7 +6,7 @@ import tls from "node:tls";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
@@ -28,7 +28,6 @@ import {
     conversationSignalAnthropic,
     extractSystem,
     buildSystem,
-    stripHistoricalImages,
     type AnthropicRequestBody,
 } from "acp-kernel/wire";
 import {
@@ -75,7 +74,7 @@ import {
 import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
 import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
 import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
-import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "./image-restore.js";
+import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { imageCompressionEnabled, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";

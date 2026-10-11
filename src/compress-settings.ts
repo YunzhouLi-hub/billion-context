@@ -7,12 +7,6 @@ import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from
 
 export type { CompressSettings } from "./config.js";
 
-/** Host-side policy default for `compress.stripImagesKeepRecent` (#617): how
- *  many of the most recent messages keep their image payloads when stripping
- *  is enabled. The strip mechanism itself lives in acp-kernel's wire layer
- *  (kernel #215) — only the opt-in policy stays host-side. */
-export const DEFAULT_STRIP_IMAGES_KEEP_RECENT = 5;
-
 /** Resolve a raw `contextLimit` value to an absolute token count.
  *  - `number` → used as-is (absolute window).
  *  - `string` ending in `%` (e.g. `"70%"`) → that fraction of `nativeLimit`.
@@ -97,8 +91,6 @@ export function mergeCompress(
         imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
-        stripImages: pick("stripImages"),
-        stripImagesKeepRecent: pick("stripImagesKeepRecent"),
         visibilityMarkers: pick("visibilityMarkers"),
         streamSummary: pick("streamSummary"),
         // `reasoning` is a third nested-object field merged sub-field-wise

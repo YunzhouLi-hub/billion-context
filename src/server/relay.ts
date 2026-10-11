@@ -1,3 +1,4 @@
+import { checkOutboundBody, OutboundBodyTooLargeError } from "../request-body-budget.js";
 // #1440 P2 cut 4: upstream relay zone (forward) extracted verbatim from src/server.ts — pure move, zero behavior change.
 
 import http from "node:http";
@@ -267,6 +268,7 @@ export async function forward(
             log("debug", `[${prepared.session.id}] [chain] outbound stamping failed (${String(err)}); forwarding unstamped`);
         }
     }
+    if (res.destroyed || res.writableEnded) return;
     // #552: wire transform shared by ALL re-send paths (compress-retry loops
     // below) so re-sent bodies carry the same rewrite as the initial forward —
     // otherwise a developer-role 400 would hit mid-stream on the first retry.
@@ -391,6 +393,18 @@ export async function forward(
         // and are forwarded byte-faithfully, untouched.
         if (typeof wireBody === "string") wireBody = scrubLoneSurrogatesOnWire(wireBody);
         applyResign(headers, wireBody);
+    }
+    try {
+        checkOutboundBody(wireBody);
+    } catch (err) {
+        if (!(err instanceof OutboundBodyTooLargeError)) throw err;
+        log("warn", `413: ${err.message}`);
+        if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", err.message, undefined, opts.streamErrorShape);
+        else {
+            res.writeHead(413, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "request_too_large", stage: "forward", message: err.message } }));
+        }
+        return;
     }
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",

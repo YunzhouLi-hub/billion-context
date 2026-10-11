@@ -220,8 +220,11 @@ export async function prepareResponses(
         if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeLocalCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
             const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
+            // #2621: pre-turn ref map for the dsh novelty gate — a freshly-landed
+            // checkpoint is a NEW id; historical quotes/replays hit old ids.
+            const knownIdsBeforeLocalCompact = new Set(Object.keys(session.state.messageRefs.byRaw));
             const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
-            const dshHit = dshLane && carriesDshLocalCompactionSummary(msgs);
+            const dshHit = dshLane && carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact);
             if (localGap && (codexHit || dshHit)) {
                 const missing = localGap.expected - localGap.matched;
                 const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
@@ -273,7 +276,7 @@ export async function prepareResponses(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+log("info", diagTagSummary(turn.messages, sessionId, renderTags));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);

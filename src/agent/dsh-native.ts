@@ -25,7 +25,15 @@
 //      ctx.agents.currentInitiator() — dsh's AsyncLocalStorage attribution,
 //      read synchronously at request time inside the agent's driver chain;
 //   5. /acp command (absorbs dsh-acp.ts, now session-bound when an
-//      initiator is active, latest-session fallback otherwise).
+//      initiator is active, latest-session fallback otherwise);
+//   6. host-title channel (#2604): dsh owns its session names (the
+//      dsh-session-title service emits log-backed `session/title` events on
+//      fallback creation, LLM-generation acceptance and user rename,
+//      latest-wins). The plugin mirrors each one to the proxy's
+//      /__bili/plugin/session-name endpoint (pi.ts #2322 pattern) so the
+//      panel labels a conversation with the host name instead of the
+//      truncated first user message. Both services are optional — older
+//      hosts degrade to the pre-#2604 labelless behavior, never block boot.
 // Native auto-compaction is disabled by the INSTALLER/LAUNCHER patch file
 // (compaction-basic auto:false override) — not by this module. dsh has no
 // compaction event hook to observe a manual /compact, so its boundary is
@@ -119,10 +127,18 @@ export type PluginContext = {
     // #1809: lifecycle disposal for registrations made inside an injected
     // callback (cordis Context.effect); optional so non-cordis hosts skip it.
     effect?: (fn: () => void | (() => void), label?: string) => void;
-    // #1590: host event bus (web-profile hosts only) — webserver/index-inject
-    // gathers per-startup rows for the web index; we push the __BILI__ global
-    // the dsh-native-client.js settings entry reads.
-    on?: (event: string, listener: (table: Array<{ kind: string; name?: string; value?: unknown }>) => void) => void;
+    // #1590 host event bus + #2604 session bus (dsh-session Events): one
+    // cordis ctx.on covers both shapes — webserver/index-inject gathers
+    // per-startup rows for the web index (__BILI__ global for the settings
+    // entry), while session/created and session/event feed the title channel.
+    on?: (event: string, listener: ((table: Array<{ kind: string; name?: string; value?: unknown }>) => void) | ((session: { id?: unknown }, event: { type?: unknown; data?: { title?: unknown } }) => void)) => void;
+    // #2604: dsh session store + title service (core services on modern
+    // builds, optional so older hosts keep the plugin alive). The folded
+    // snapshot seeds labels for sessions whose `session/title` events all
+    // predate this process (resumes); the store lookup re-labels sids with
+    // live traffic after a proxy respawn (fresh dedup key, nothing armed).
+    sessions?: { get?: (id: string) => { id?: unknown } | undefined; list?: () => Array<{ id?: unknown }> };
+    sessionTitle?: { get?: (session: unknown) => { title?: unknown } | undefined };
     // #1809: browser HTTP carrier (web/desktop profiles only) — hosts the live
     // /bili/origin route the settings entry polls. Optional like llm/
     // profileContext above: TUI/headless profiles lack it.
@@ -189,6 +205,76 @@ let webProfileWarned = false;
 function currentOrigin(): string | undefined {
     const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
     return register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+}
+
+// #2604: host-title channel (mirror of pi.ts #2322/#2354): dsh owns its
+// session names; the proxy web UI labels a conversation from meta.hostTitle
+// when present. Pushes are fire-and-forget, deduped per (base, sid) — a
+// failed POST re-arms via map deletion, and keying on base means a
+// respawned/rebound proxy re-learns every title on next traffic or event
+// instead of trusting a dead origin's memory.
+const lastReportedTitles = new Map<string, string>();
+type DshSessionLike = { id?: unknown };
+const titleServices: { sessions?: PluginContext["sessions"]; sessionTitle?: PluginContext["sessionTitle"] } = {};
+
+function reportDshSessionName(base: string | undefined, sid: string | undefined, name: string): void {
+    if (base === undefined || typeof sid !== "string" || sid.length === 0) return;
+    const key = `${base}\u0000${sid}`;
+    const prev = lastReportedTitles.get(key);
+    if (prev === name || (name === "" && prev === undefined)) return;
+    lastReportedTitles.set(key, name);
+    fetch(`${base}/__bili/plugin/session-name`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId: sid, name }),
+        signal: AbortSignal.timeout(5000),
+    }).then((res) => {
+        if (!res.ok) lastReportedTitles.delete(key);
+    }).catch(() => {
+        lastReportedTitles.delete(key);
+    });
+}
+
+function seedDshSessionTitle(session: DshSessionLike): void {
+    const sid = typeof session.id === "string" ? session.id : undefined;
+    const get = titleServices.sessionTitle?.get;
+    if (sid === undefined || typeof get !== "function") return;
+    let title: unknown;
+    try {
+        title = get.call(titleServices.sessionTitle, session)?.title;
+    } catch {
+        return;
+    }
+    if (typeof title === "string" && title.length > 0) reportDshSessionName(register.base, sid, title);
+}
+
+// Lazy re-label for a sid with live traffic but no reported title yet: covers
+// resumed sessions whose title predates this process and proxies that replaced
+// a dead one since the last event (fresh base = fresh dedup key, nothing armed).
+function ensureDshTitleReported(sid: string): void {
+    const base = register.base;
+    if (base === undefined || lastReportedTitles.has(`${base}\u0000${sid}`)) return;
+    const lookup = titleServices.sessions?.get;
+    if (typeof lookup !== "function") return;
+    let session: DshSessionLike | undefined;
+    try {
+        session = lookup.call(titleServices.sessions, sid);
+    } catch {
+        return;
+    }
+    if (session !== undefined) seedDshSessionTitle(session);
+}
+
+function sweepLiveDshTitles(): void {
+    const list = titleServices.sessions?.list;
+    if (typeof list !== "function") return;
+    let sessions: Array<DshSessionLike>;
+    try {
+        sessions = list.call(titleServices.sessions);
+    } catch {
+        return;
+    }
+    for (const session of sessions) seedDshSessionTitle(session);
 }
 
 // Runtime-info cache (#955, rekeyed per model in #2381): one entry per
@@ -882,10 +968,27 @@ export function apply(ctx: PluginContext): void {
     // synchronously below; spawn mode binds it after bootstrap, so at
     // startup-time index collection that entry degrades to a hint instead of
     // a stale link.
-    ctx.on?.("webserver/index-inject", (table) => {
+    ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
         const origin = currentOrigin();
         if (origin !== undefined) table.push({ kind: "global", name: "__BILI__", value: { origin } });
     });
+
+    // #2604: follow the host session name (dsh-session-title service). Every
+    // titled session emits `session/title` (fallback creation, LLM acceptance,
+    // user rename — latest-wins); `session/created` seeds resumed sessions
+    // whose title predates this process. Fire-and-forget: a title push must
+    // never block session publication or the driver chain.
+    if (typeof ctx.on === "function") {
+        ctx.on("session/created", (session: { id?: unknown }) => {
+            seedDshSessionTitle(session);
+        });
+        ctx.on("session/event", (session, event) => {
+            if (event?.type !== "session/title") return;
+            const title = event.data?.title;
+            if (typeof title !== "string" || title.length === 0) return;
+            reportDshSessionName(register.base, typeof session.id === "string" ? session.id : undefined, title);
+        });
+    }
 
     // #1809: the row above is a snapshot taken at index render — spawn mode
     // binds register.base only AFTER bootstrap, so an already-loaded page (a
@@ -1156,6 +1259,7 @@ export function apply(ctx: PluginContext): void {
         const attr = attributionOf(ctx);
         if (attr.state !== "ok") return undefined;
         const sid = attr.sid;
+        ensureDshTitleReported(sid);
         // #2381: size this request against the model IT routes to — session
         // header first, global default only as fallback. Stamping reads ONLY
         // that key's own entry, so a mismatched model's numbers can never be
@@ -1216,6 +1320,26 @@ export function apply(ctx: PluginContext): void {
     } else if (ctx.llm !== undefined || ctx.agentDefaultModel !== undefined) {
         modelInfo.services = { llm: ctx.llm, agentDefaultModel: ctx.agentDefaultModel };
         refreshModelInfo(register.base ?? state.origin);
+    }
+
+    // #2604: title-channel services (dsh-session / dsh-session-title) — same
+    // dynamic-inject discipline as the runtime-info sources above: missing
+    // services degrade to the pre-#2604 labelless behavior, never block boot.
+    // The sweep seeds whatever is already live (resume published before us).
+    if (typeof ctx.inject === "function") {
+        try {
+            ctx.inject(["sessions", "sessionTitle"], (sub) => {
+                titleServices.sessions = sub.sessions;
+                titleServices.sessionTitle = sub.sessionTitle;
+                sweepLiveDshTitles();
+            });
+        } catch {
+            // older builds without the services: labels stay host-less
+        }
+    } else if (ctx.sessions !== undefined || ctx.sessionTitle !== undefined) {
+        titleServices.sessions = ctx.sessions;
+        titleServices.sessionTitle = ctx.sessionTitle;
+        sweepLiveDshTitles();
     }
 
     // #1772/#2474: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
@@ -1296,6 +1420,14 @@ export function _resetRegisterForTest(base: string | undefined): void {
  *  path without fabricating model traffic. */
 export function maybeRetryForTest(ctx: PluginContext): void {
     maybeRetry(ctx);
+}
+
+/** Test hook (#2604): reset the host-title channel (dedup map + resolved
+ *  services) so scenarios start un-armed. */
+export function _resetTitlesForTest(): void {
+    lastReportedTitles.clear();
+    titleServices.sessions = undefined;
+    titleServices.sessionTitle = undefined;
 }
 
 /** Test hook (#1797): resolve once every in-flight attach/recovery chain has

@@ -450,30 +450,6 @@ export type CompressSettings = {
      *  enabled at some level. Deepest-wins like every other scalar field. */
     rules?: boolean;
 
-    /** Opt-in removal of historical image payloads, executed by the kernel's
-     *  wire-layer primitive `stripHistoricalImages` from "acp-kernel/wire"
-     *  (kernel #215; host-side policy only). When true, every message except
-     *  the most recent {@link stripImagesKeepRecent} has its image parts dropped
-     *  before the wire rebuild (image-only content collapses to an "[image]"
-     *  placeholder). Off by default — the #488 image floor / overflow 502 stays
-     *  the opt-in signal until this is enabled.
-     *
-     *  [#1995] On anthropic sessions the strip boundary is FOLD-ANCHORED when
-     *  an active compression fold exists: instead of the sliding `len -
-     *  keepRecent` window (which moves the byte boundary every turn and breaks
-     *  the prompt cache at the most expensive content), the cutoff sticks to
-     *  the last fold-covered wire message and only moves on compression
-     *  events — the stripped prefix is byte-stable between folds. Recovery for
-     *  stripped pixels: `decompress({ imageRef })` (files under
-     *  <state>/retrieve/img/<session>/, one-week TTL) and the ref-carrying
-     *  `[image: … · mNNNNN]` notes summaries emit. The other wires keep the
-     *  sliding window until their strip placeholders are made id-stable
-     *  (openai/google flip ids on strip; see src/image-restore.ts). */
-    stripImages?: boolean;
-    /** With {@link stripImages}, how many trailing messages keep their images
-     *  verbatim (default 5). Ignored unless stripImages is true. Serves as the
-     *  FALLBACK window on anthropic when no active fold anchors the boundary. */
-    stripImagesKeepRecent?: number;
     /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
      *  tool calls at request time (src/reasoning-drop.ts, aligned with
      *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
@@ -1798,9 +1774,9 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "preserveRecentMessages", "preserveRecentTokens",
-    "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent",
+    "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
-    "neverPreserveRecentTools", "preserveRecentTools", "stripImages",
+    "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
@@ -1854,6 +1830,7 @@ export function loadConfigFile(): FileConfig {
             normalizeLegacyAllowDshCompaction(obj);
             warnUnknownTopLevelKeys(obj);
             warnInertResignPassthrough(obj);
+            warnInertStripImages(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1958,6 +1935,22 @@ export function resolveResignSettings(env: NodeJS.ProcessEnv = process.env, prov
 // body be the only signal. Dedup by dead-key signature (#1815 style): re-warn
 // when the set changes, stay quiet while it stays fixed or empty.
 let inertResignPassthroughSignature: string | null = null;
+/** #2607 follow-up: `compress.stripImages` was REMOVED — default media folding
+ *  (#2640) replaced it, and the strip itself was a turn-over-turn prompt-cache
+ *  breaker on three of four wires (sliding cutoff). Old configs that still set
+ *  the keys get this one-time inert notice instead of silent no-op (the parse
+ *  whitelist simply no longer carries the fields). */
+function warnInertStripImages(obj: Record<string, unknown>): void {
+    const compress = obj.compress;
+    if (!compress || typeof compress !== "object" || Array.isArray(compress)) return;
+    const hit = ["stripImages", "stripImagesKeepRecent"].filter((k) => (compress as Record<string, unknown>)[k] !== undefined);
+    const sig = hit.join(",");
+    if (sig === "" || sig === seenInertStripImagesSignature) return;
+    seenInertStripImagesSignature = sig;
+    loggerLog("warn", `[acp-config] compress.${hit.join("/compress.")} is INERT — compress.stripImages was removed: media now folds by default (#2640) and decompress({ imageRef }) recovers folded pixels; nothing is stripped from the wire anymore. Remove the key(s) from the config.`);
+}
+let seenInertStripImagesSignature = "";
+
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];
     const consider = (map: unknown, providerBlockFor: (key: string) => ResignFileSettings | undefined): void => {
@@ -2210,7 +2203,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (!numberOrPercent(obj[key])) { ok = false; continue; }
         (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
     }
-    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent"] as const) {
+    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars"] as const) {
         takeNumber(key);
     }
     // #2228: the decision side-call budget must be positive — 0/negative would
@@ -2277,10 +2270,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj.preserveRecentTools;
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
         else out.preserveRecentTools = (v as string[]).map((x) => x.trim());
-    }
-    if ("stripImages" in obj) {
-        if (typeof obj.stripImages !== "boolean") ok = false;
-        else out.stripImages = obj.stripImages;
     }
     if ("visibilityMarkers" in obj) {
         if (typeof obj.visibilityMarkers !== "boolean") ok = false;

@@ -349,10 +349,12 @@ export type Session = {
      *  commit/drop machinery below handles them (they are never re-created). */
     pendingRetrievals: PendingRetrieval[];
     /** #1995 in-memory only (NOT persisted — buildRecord omits it): ref → images
-     *  index built per request from the INBOUND body while stripImages is armed,
-     *  so decompress({ imageRef }) can pull a stripped/folded image's original
-     *  pixels back. Latest-wins (the client re-sends full history every turn, so
-     *  each request's index is complete); cleared when stripImages is off. Values
+     *  index built per request from the INBOUND body (default media folding
+     *  archives pixels off the wire, #2640), so decompress({ imageRef }) can
+     *  pull a folded image's original pixels back. Latest-wins (the client
+     *  re-sends full history every turn, so each request's index is complete;
+     *  count_tokens requests carry no usable protocol view and clear it).
+     *  Values
      *  hold only metadata + the on-disk path (bytes are spilled at index-time and
      *  never retained), so residency stays O(refs) regardless of image volume. */
     incomingImageIndex?: Map<string, Array<{ mediaType: string; bytes: number; width?: number; height?: number; path: string }>>;

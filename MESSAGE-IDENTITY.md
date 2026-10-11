@@ -167,8 +167,16 @@ lanes), never a wrong claim. The verification matrix lives in
 `tests/identity-proof.test.ts` (mechanism-level, judge-billed, after
 `tests/cache-proof.test.ts`): 4 wires × 3 phases (fold settles → id-scheme+
 serialization churn keeps coverage → mid-history edit honestly re-enters),
-a reconcile-off control proving the churn re-bills without the layer, and a
-cross-wire client swap (anthropic → chat) retaining coverage end to end.
+a reconcile-off control proving the churn re-bills without the layer, a
+cross-wire client swap (anthropic → chat) retaining coverage end to end,
+and a model-switch phase (#2636): the chat lane carries reasoning-bearing
+assistant turns and image-bearing user turns, then replays the history onto
+a differently-shaped model (reasoning inlined pair→merged, images
+placeholdered) — coverage must survive the shape churn with the covered
+thinking never re-entering, judged on the FIRST post-churn body (a fresh
+server-side compress may re-fold a failed replay — the healed round-2 must
+never stand in for the retention proof), plus its own reconcile-off control
+proving this churn class re-bills without the layer.
 
 ## Known cost of the hash axiom — and how it was fixed
 

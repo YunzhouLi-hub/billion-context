@@ -57,6 +57,18 @@ export async function prepareAnthropic(
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
+    // #2648: when the host pins a system block to cache_control.scope:"global",
+    // Anthropic renders tools BEFORE system, so the six ACP tools bili injects here
+    // (narrower scope) land ahead of a global block → upstream 400 ("scope:global …
+    // found after content with a narrower cache scope"). Global-scope caching is the
+    // host's own cross-prompt posture; bili's per-session injection cannot sit ahead
+    // of it, so stand down (forward untouched) rather than 400. Healthy main turns
+    // use ephemeral/unscoped system, so they keep full compression.
+    if (!pluginMode && hasGlobalScopeSystem(parsed)) {
+        log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648)`);
+        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
     let processedMessages: CoreMessage[] = [];
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
@@ -67,6 +79,10 @@ export async function prepareAnthropic(
     let clientCacheControls: Map<string, unknown> | undefined;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
+    // #2483: single source for the effective render strategy — processTurn, the
+    // diag log and Prepared must all report what was actually rendered (the
+    // log label used to hardcode "text-only" and lie under renderNone).
+    const renderStrategy = knobRenderNone() ? "none" : "text-only";
 
     // #1085: sticky head-system anchor — freeze the client's own `system` text
     // at first sight and forward it byte-stable; detected changes ride as
@@ -201,7 +217,7 @@ export async function prepareAnthropic(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -226,7 +242,7 @@ export async function prepareAnthropic(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
         // stops nagging — including the emergency path, per session.
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
@@ -388,7 +404,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
 }
 
 
@@ -404,4 +420,13 @@ function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
     const stops = parsed.stop_sequences;
     if (!Array.isArray(stops)) return false;
     return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
+}
+
+// #2648: true when any system block pins cache_control.scope:"global". bili's
+// narrower-scope ACP-tool injection renders ahead of such a block and 400s
+// upstream (see the passthrough gate above), so the host must be left untouched.
+function hasGlobalScopeSystem(parsed: AnthropicRequestBody): boolean {
+    const sys = parsed.system;
+    if (!Array.isArray(sys)) return false;
+    return sys.some((b) => (b.cache_control as { scope?: unknown } | undefined)?.scope === "global");
 }
