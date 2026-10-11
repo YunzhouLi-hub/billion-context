@@ -54,13 +54,51 @@
 // while the vanished head ids fall into the honest unmatched/archive path —
 // no death spiral, and the copy self-heals on the next full pass.
 //
+// Pass 3 (#2636) — ASSISTANT-TURN key. A host replaying one conversation
+// across models re-serializes every thinking-bearing assistant turn: the
+// same-model replay carries reasoning in a structured field (kernel: adjacent
+// reasoning + text cores), a cross-model replay inlines the thinking as plain
+// text (kernel: ONE merged text core — the #64 tag-splitter cannot help,
+// there is no dialect tag to split on). Same turn bytes, different core
+// shapes: N↔1 and 1→N. Pass 0 stops at the first shape change (positions
+// misalign), so the turn key matches the FULL normalized turn text either
+// way — pair→merged (both member ids claim the one witness) and merged→pair
+// (one old id claims both new ids). Exact normalized equality — never fuzzy.
+//
+// Pass 4 (#2636) — IMAGE-CAPABILITY variants. Replaying onto a text-only
+// model replaces every image part with a fixed placeholder line (pi's
+// NON_VISION_USER_IMAGE_PLACEHOLDER), and replaying back restores the real
+// parts — so a covered user text flips between `text` and
+// `text + "\n" + placeholder` across the switch. The variant pass tries one
+// trailing placeholder line stripped/appended against the anchor's
+// normalized identity.
+//
+// Reap (#2695) — ZOMBIE STREAK. When a host deletes or decimates history
+// WITHOUT an announced boundary (no dsh framing, no /compact), the covered
+// substrate of the affected blocks never comes back, but duplicate-content
+// re-derivation keeps a residual id alive so syncBlocks re-activates the
+// block forever: its acp_summary carrier keeps rendering (and flapping)
+// mid-list every turn — a permanent prefix-cache buster. The per-block
+// coverage record (METADATA_FOLD_COVERAGE) now streak-counts passes where a
+// strict MAJORITY of the block's covered ids is absent (2*(p+r) < t), gated
+// on verified presence (e === 1 — never-represent substrates like
+// view-folding hosts keep their #2202 status-quo semantics). After
+// FOLD_DRIFT_ESCALATE_PASSES consecutive majority-loss passes the block is
+// REAPED — removed from state.blocks (not deactivated: syncBlocks would
+// resurrect it) with #395 archive semantics, blockContents retained for the
+// derived-decompress fallback. Proxy mode only: a plugin-mode fold
+// legitimately replaces the covered history (the agent's own compress runs
+// against its private state), so absence there is sanctioned.
+//
 // Modes (config `compress.reconcile`, env BILI_FOLD_RECONCILE):
 //   "off"    — disabled (pre-#1921 behavior).
 //   "warn"   — compute + log only, no rewrite.
 //   "repair" — rewrite block ids (default).
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
-import type { Session } from "./session.js";
+import { reapDestroyedSubstrate, type Session } from "./session.js";
+import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
+import { recordConflict } from "./conflict-watch.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -104,9 +142,14 @@ export const METADATA_FOLD_COVERAGE = "foldCoverageByBlock";
  *  side-requests (#1075: title-gen / WebSearch refinement "carry only a
  *  handful of brand-new messages") — no drift evidence is taken from them.
  *  Same value as REWRITE_MIN_INCOMING_TOTAL (src/session.ts), which the #1195
- *  sibling warn guards with; kept local so this module stays dependency-free
- *  beyond its type import. */
+ *  sibling warn guards with; kept local so the module's only host imports
+ *  stay the #2695 reap/ledger hooks below. */
 const SIDE_REQUEST_MAX_MSGS = 10;
+/** pi's NON_VISION_USER_IMAGE_PLACEHOLDER (pi-stable-ai transform-messages):
+ *  replaying a conversation onto a text-only model replaces every image
+ *  part with this fixed line — the byte-stable seam pass 4 matches. Kept in
+ *  sync with the host constant; it has never changed since introduction. */
+const USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 
 /** #2193 follow-up: clear the drift-episode state. The main path resets it on
  *  every non-total-loss pass; the early exits of reconcileFoldCoverage must do
@@ -139,14 +182,30 @@ export interface FoldAnchor {
     t?: string;
     /** Length of the anchor-time text — collision guard for norm claims. */
     b: number;
+    /** #2636: assistant-turn key — normalized full-turn text (reasoning +
+     *  seam + reply) of the turn this core belonged to, whichever wire form
+     *  the turn was replayed in. Bare assistant cores only. */
+    p?: string;
+    /** #2636: second seam form of the turn key (pi concatenates the parts
+     *  with "", some hosts emit a "\n") — set only when the two differ
+     *  after normalization. */
+    p2?: string;
+    /** #2636: sibling core of the same turn (the text core of a reasoning
+     *  core and vice versa) — lets a pair claim collapse onto one merged
+     *  witness without a second lookup. */
+    x?: string;
 }
 
 interface ReconciliationPlan {
-    /** old covered id → new inbound id it was matched to. */
-    claims: Map<string, string>;
+    /** old covered id → new inbound id(s) it was matched to. One→many: a
+     *  merged core stands in for a reasoning+text pair (model switch, #2636).
+     *  Many→one maps both members to the same single target. */
+    claims: Map<string, string[]>;
     byPos: number;
     byTool: number;
     byNorm: number;
+    byTurn: number;
+    byImage: number;
     /** Covered ids missing from the resent history with no match — either
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
@@ -177,6 +236,11 @@ interface FoldReconcileResult {
     byPos: number;
     byTool: number;
     byNorm: number;
+    byTurn: number;
+    byImage: number;
+    /** #2695: fold blocks reaped this pass (removed from state.blocks after
+     *  a majority-loss zombie streak). */
+    reaped: number;
     unmatched: number;
 }
 
@@ -198,6 +262,14 @@ export interface FoldBlockCoverage {
      *  accrual) from structural absence (view-folding hosts whose resends never
      *  carry raw originals → unverifiable, keep status-quo booking). */
     e?: 1;
+    /** #2695: consecutive passes with a strict MAJORITY of covered ids absent
+     *  (2*(p+r) < t), counted only for verified substrates (e === 1). A
+     *  healthy proxy-mode fold re-receives its covered originals every turn
+     *  (p+r = t resets this to 0); model-switch churn reclaims most ids via
+     *  anchors (p+r ≈ t likewise). When z reaches FOLD_DRIFT_ESCALATE_PASSES
+     *  the substrate is taken for destroyed by an unannounced client rewrite
+     *  and the block is reaped (reapDestroyedSubstrate, src/session.ts). */
+    z?: number;
 }
 
 const seenInvalidEnv = new Set<string>();
@@ -258,6 +330,73 @@ export function normalizedIdentityNoToolCallId(message: CoreMessage): string {
     const h = createHash("sha256");
     h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${normalizeMessageText(message.text)}`);
     return h.digest("hex").slice(0, 16);
+}
+
+/** Identity-layout hash over an arbitrary replacement text — used by the
+ *  image-capability pass to compare an anchor against a candidate whose text
+ *  has a placeholder line stripped/appended. */
+function identityWithText(message: CoreMessage, text: string): string {
+    normalizedIdentityWork++;
+    const h = createHash("sha256");
+    h.update(`${message.role}\u0000${message.contentType}\u0000${message.toolName ?? ""}\u0000${message.toolCallId ?? ""}\u0000${normalizeMessageText(text)}`);
+    return h.digest("hex").slice(0, 16);
+}
+
+/** #2636: assistant-turn key — the turn's full normalized text, whichever
+ *  wire form it was replayed in. Split form contributes reasoning + seam +
+ *  reply; merged form (thinking inlined as plain text by a cross-model host
+ *  replay) contributes its own text — which IS that same join, except the
+ *  seam byte is host-specific (pi concatenates the parts with "", some
+ *  hosts emit a "\n"), so pairs carry a second seam-less key (p2) and the
+ *  matcher probes both. Equal only when normalization collapses the
+ *  difference. */
+ function turnKeyOf(reasoning: string | undefined, text: string | undefined): string {
+    normalizedIdentityWork++;
+    const joined = reasoning !== undefined && reasoning !== "" && text !== undefined && text !== ""
+        ? `${reasoning}\n${text}`
+        : (reasoning ?? "") + (text ?? "");
+    const h = createHash("sha256");
+    h.update(`turn\u0000${normalizeMessageText(joined)}`);
+    return h.digest("hex").slice(0, 16);
+}
+
+function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefined): string {
+    normalizedIdentityWork++;
+    const joined = (reasoning ?? "") + (text ?? "");
+    const h = createHash("sha256");
+    h.update(`turn\u0000${normalizeMessageText(joined)}`);
+    return h.digest("hex").slice(0, 16);
+}
+
+/** Turn context for the anchor seed loop: per assistant-core id, the turn
+ *  key(s) and (for split-form turns) the sibling core id. Built lazily — a
+ *  steady-state pass reuses stored anchors and never pays this. */
+interface TurnCtx { p?: string; p2?: string; x?: string }
+export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
+    const ctx = new Map<string, TurnCtx>();
+    for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        if (m.id === undefined || m.role !== "assistant" || (m.toolCallId !== undefined && m.toolCallId !== "")) continue;
+        if (m.contentType === "reasoning") {
+            const next = msgs[i + 1];
+            if (next !== undefined && next.id !== undefined && next.role === "assistant" && next.contentType === "text" &&
+                (next.toolCallId === undefined || next.toolCallId === "")) {
+                const key = turnKeyOf(m.text, next.text);
+                const seamless = turnKeyOfSeamless(m.text, next.text);
+                ctx.set(m.id, seamless !== key ? { p: key, p2: seamless, x: next.id } : { p: key, x: next.id });
+                ctx.set(next.id, seamless !== key ? { p: key, p2: seamless, x: m.id } : { p: key, x: m.id });
+            } else {
+                ctx.set(m.id, { p: turnKeyOf(m.text, undefined) });
+            }
+        } else if (m.contentType === "text") {
+            const prev = msgs[i - 1];
+            if (prev === undefined || prev.id === undefined || prev.role !== "assistant" || prev.contentType !== "reasoning" ||
+                (prev.toolCallId !== undefined && prev.toolCallId !== "")) {
+                ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
+            }
+        }
+    }
+    return ctx;
 }
 
 /** #2480: canonical JSON — recursively key-sorted, whitespace-free projection
@@ -333,13 +472,16 @@ export function positionalFingerprint(message: CoreMessage): string {
     return h.digest("hex").slice(0, 16);
 }
 
-function anchorFrom(message: CoreMessage): FoldAnchor {
+function anchorFrom(message: CoreMessage, ctx?: TurnCtx): FoldAnchor {
     const t = message.toolCallId !== undefined && message.toolCallId !== "" ? message.toolCallId : undefined;
     const anchor: FoldAnchor = { n: normalizedIdentity(message), r: message.role, b: message.text?.length ?? 0 };
     if (t !== undefined) {
         anchor.t = t;
         anchor.m = normalizedIdentityNoToolCallId(message);
     }
+    if (ctx?.p !== undefined) anchor.p = ctx.p;
+    if (ctx?.p2 !== undefined) anchor.p2 = ctx.p2;
+    if (ctx?.x !== undefined) anchor.x = ctx.x;
     return anchor;
 }
 
@@ -354,15 +496,11 @@ interface BlockLike {
  *  (consumed into a newer fold, host-expanded, or drifted out of the resent
  *  history) by setting active=false while KEEPING its effectiveMessageIds —
  *  those dead-lineage ids can never re-anchor and would sit in `missing`
- *  permanently, inflating the drift warn ~2x (#2293). Same caliber as the
- *  #1195 pre-turn snapshot. */
+ *  permanently, inflating the drift warn ~2x (#2293). Delegates to
+ *  coveredRealHistoryIds so the single real-history caliber (#2627) is
+ *  implemented exactly once. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
-    const covered = new Set<string>();
-    for (const block of blocks) {
-        if (!block.active) continue;
-        for (const id of block.effectiveMessageIds ?? []) covered.add(id);
-    }
-    return covered;
+    return coveredRealHistoryIds(blocks);
 }
 
 /** Pure core: plan the reconciliation between the previous pass order and the
@@ -377,7 +515,7 @@ export function planReconciliation(
     covered: Set<string>,
     positions?: { ids: string[]; canon: string[] },
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byNorm: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined };
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -437,13 +575,13 @@ export function planReconciliation(
     // #2334: norms are computed LAZILY — pass 1 (toolCallId) never needs them,
     // so a fully tool-claimable churn region pays zero normalizations; pass 2
     // computes each norm once, only for the candidates pass 1 left behind.
-    const candidates: { id: string; message: CoreMessage; norm?: string }[] = [];
+    const candidates: { id: string; message: CoreMessage; pos: number; norm?: string }[] = [];
     for (let i = prefix; i < newOrder.length - suffix; i++) {
         const id = newOrder[i];
         if (covered.has(id)) continue;
         const message = byId.get(id);
         if (message === undefined) continue;
-        candidates.push({ id, message });
+        candidates.push({ id, message, pos: i });
     }
     const claimedCandidates = new Set<string>();
 
@@ -473,7 +611,7 @@ export function planReconciliation(
             const oldId = oldOrder[i];
             const newId = newOrder[i];
             if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId)) continue;
-            plan.claims.set(oldId, newId);
+            plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
         }
@@ -485,7 +623,7 @@ export function planReconciliation(
             const oldId = oldOrder[iOld];
             const newId = newOrder[iNew];
             if (oldId === newId || !missingSet.has(oldId) || covered.has(newId) || claimedCandidates.has(newId) || plan.claims.has(oldId)) continue;
-            plan.claims.set(oldId, newId);
+            plan.claims.set(oldId, [newId]);
             claimedCandidates.add(newId);
             plan.byPos++;
         }
@@ -512,7 +650,7 @@ export function planReconciliation(
             if (bucket === undefined) continue;
             const usable = bucket.filter((c) => !claimedCandidates.has(c.id) && c.message.role === anchor.r);
             if (usable.length !== 1) continue; // ambiguous or exhausted → skip
-            plan.claims.set(oldId, usable[0].id);
+            plan.claims.set(oldId, [usable[0].id]);
             claimedCandidates.add(usable[0].id);
             plan.byTool++;
         }
@@ -546,9 +684,176 @@ export function planReconciliation(
         const len = message.text?.length ?? 0;
         if (Math.abs(len - anchor.b) > Math.max(256, anchor.b >> 2)) continue;
         g.anchors.push(anchor);
-        plan.claims.set(oldId, newId);
+        plan.claims.set(oldId, [newId]);
         claimedCandidates.add(newId);
         plan.byNorm++;
+    }
+
+    // Pass 3 — assistant-turn key (#2636). Both forms carry the same turn
+    // bytes, so the normalized turn key matches them in either direction:
+    // pair→merged (both member ids claim the one witness) and merged→pair
+    // (one old id claims both new ids). Exact normalized equality of the
+    // FULL turn — never fuzzy; ambiguous keys (duplicated turns) skip.
+    if (missingMiddle.length > 0 && candidates.length > 0) {
+        const byPos = new Map<number, (typeof candidates)[number]>();
+        for (const cand of candidates) byPos.set(cand.pos, cand);
+        const singleTurnKeys = new Map<string, string[]>();
+        const pairTurnKeys = new Map<string, [string, string][]>();
+        const isBareAssistantCore = (m: CoreMessage): boolean =>
+            m.role === "assistant" && (m.toolCallId === undefined || m.toolCallId === "");
+        for (const cand of candidates) {
+            if (claimedCandidates.has(cand.id)) continue;
+            if (!isBareAssistantCore(cand.message)) continue;
+            if (cand.message.contentType === "text") {
+                const key = turnKeyOf(undefined, cand.message.text);
+                const bucket = singleTurnKeys.get(key);
+                if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
+                else bucket.push(cand.id);
+            } else if (cand.message.contentType === "reasoning") {
+                const next = byPos.get(cand.pos + 1);
+                if (next !== undefined && !claimedCandidates.has(next.id) && isBareAssistantCore(next.message) && next.message.contentType === "text") {
+                    const pair = [cand.id, next.id] as [string, string];
+                    for (const key of new Set([turnKeyOf(cand.message.text, next.message.text), turnKeyOfSeamless(cand.message.text, next.message.text)])) {
+                        const bucket = pairTurnKeys.get(key);
+                        if (bucket === undefined) pairTurnKeys.set(key, [pair]);
+                        else bucket.push(pair);
+                    }
+                } else {
+                    // thinking-only turn kept in same-model shape: the reasoning
+                    // core IS the whole turn (mirrors turnContexts' isolated case).
+                    const key = turnKeyOf(cand.message.text, undefined);
+                    const bucket = singleTurnKeys.get(key);
+                    if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
+                    else bucket.push(cand.id);
+                }
+            }
+        }
+        if (singleTurnKeys.size > 0 || pairTurnKeys.size > 0) {
+            const candById = new Map(candidates.map((c) => [c.id, c] as const));
+            for (const oldId of missingMiddle) {
+                if (plan.claims.has(oldId)) continue;
+                const anchor = anchors[oldId];
+                if (anchor === undefined || anchor.p === undefined) continue;
+                const probeKeys = new Set([anchor.p, anchor.p2].filter((k): k is string => k !== undefined));
+                const singles: string[] = [];
+                const pairs: [string, string][] = [];
+                for (const key of probeKeys) {
+                    for (const id of singleTurnKeys.get(key) ?? []) {
+                        const c = candById.get(id);
+                        if (c !== undefined && !claimedCandidates.has(id) && !singles.includes(id)
+                            && (c.message.text?.length ?? 0) + 64 >= anchor.b) singles.push(id);
+                    }
+                    for (const p of pairTurnKeys.get(key) ?? []) {
+                        if (pairs.some(([a, b]) => a === p[0] && b === p[1])) continue;
+                        if (claimedCandidates.has(p[0]) || claimedCandidates.has(p[1])) continue;
+                        const ca = candById.get(p[0]);
+                        const cb = candById.get(p[1]);
+                        if (ca === undefined || cb === undefined) continue;
+                        const joined = (ca.message.text?.length ?? 0) + (cb.message.text?.length ?? 0) + 1;
+                        if (Math.abs(joined - anchor.b) <= Math.max(256, anchor.b >> 2)) pairs.push(p);
+                    }
+                }
+                if (singles.length + pairs.length !== 1) continue; // absent or ambiguous → skip
+                const claimSibling = (targets: string[]): void => {
+                    if (anchor.x === undefined || !missingSet.has(anchor.x) || plan.claims.has(anchor.x)) return;
+                    plan.claims.set(anchor.x, targets);
+                };
+                if (singles.length === 1) {
+                    plan.claims.set(oldId, [singles[0]]);
+                    claimedCandidates.add(singles[0]);
+                    claimSibling([singles[0]]);
+                } else {
+                    const [a, b] = pairs[0];
+                    plan.claims.set(oldId, [a, b]);
+                    claimedCandidates.add(a);
+                    claimedCandidates.add(b);
+                    claimSibling([a, b]);
+                }
+                plan.byTurn++;
+            }
+        }
+    }
+
+    // Pass 4 — image-capability variants (#2636). Try the candidate with one
+    // trailing placeholder line stripped, and the candidate with one
+    // appended, against the anchor's normalized identity. User cores only:
+    // tool results carry a toolCallId and pass 1 already re-anchors them
+    // without a length guard.
+    if (missingMiddle.length > 0 && candidates.length > 0) {
+        const stripVariants = new Map<string, string[]>();
+        const appendVariants = new Map<string, string[]>();
+        for (const cand of candidates) {
+            if (claimedCandidates.has(cand.id)) continue;
+            const m = cand.message;
+            if (m.role !== "user" || m.contentType !== "text" || (m.toolCallId !== undefined && m.toolCallId !== "")) continue;
+            const raw = m.text ?? "";
+            const suffix = `\n${USER_IMAGE_PLACEHOLDER}`;
+            if (raw.endsWith(suffix)) {
+                const key = identityWithText(m, raw.slice(0, raw.length - suffix.length));
+                const bucket = stripVariants.get(key);
+                if (bucket === undefined) stripVariants.set(key, [cand.id]);
+                else bucket.push(cand.id);
+            }
+            const appendKey = identityWithText(m, raw + suffix);
+            const bucket2 = appendVariants.get(appendKey);
+            if (bucket2 === undefined) appendVariants.set(appendKey, [cand.id]);
+            else bucket2.push(cand.id);
+        }
+        const candById = new Map(candidates.map((c) => [c.id, c] as const));
+        if (stripVariants.size > 0 || appendVariants.size > 0) {
+            for (const oldId of missingMiddle) {
+                if (plan.claims.has(oldId)) continue;
+                const anchor = anchors[oldId];
+                if (anchor === undefined || anchor.t !== undefined) continue;
+                const take = (map: Map<string, string[]>): string | undefined => {
+                    const bucket = map.get(anchor.n);
+                    if (bucket === undefined) return undefined;
+                    const usable = bucket.filter((id) => {
+                        const c = candById.get(id);
+                        return c !== undefined && !claimedCandidates.has(id) && (c.message.text?.length ?? 0) + USER_IMAGE_PLACEHOLDER.length + 64 >= anchor.b;
+                    });
+                    return usable.length === 1 ? usable[0] : undefined;
+                };
+                const target = take(stripVariants) ?? take(appendVariants);
+                if (target === undefined) continue;
+                plan.claims.set(oldId, [target]);
+                claimedCandidates.add(target);
+                plan.byImage++;
+            }
+            // Identical-content families (pi's "Attached image(s) from tool
+            // result:" wrapper repeats verbatim) defeat the unique-witness
+            // guard above — K anchors and K candidates all share one variant
+            // key. Fall back to k-th pairing in conversation order, the same
+            // discipline as the normalized-identity pass: claim only when the
+            // anchor count equals the candidate count for the key.
+            const familyClaim = (map: Map<string, string[]>): void => {
+                const byNorm = new Map<string, string[]>();
+                for (const oldId of missingMiddle) {
+                    if (plan.claims.has(oldId)) continue;
+                    const anchor = anchors[oldId];
+                    if (anchor === undefined || anchor.t !== undefined) continue;
+                    const bucket = byNorm.get(anchor.n);
+                    if (bucket === undefined) byNorm.set(anchor.n, [oldId]);
+                    else bucket.push(oldId);
+                }
+                for (const [key, bucket] of map) {
+                    const usable = bucket.filter((id) => !claimedCandidates.has(id));
+                    const oldIds = byNorm.get(key) ?? [];
+                    if (oldIds.length === 0 || oldIds.length !== usable.length) continue;
+                    for (let k = 0; k < usable.length; k++) {
+                        const anchor = anchors[oldIds[k]]!;
+                        const c = candById.get(usable[k]);
+                        if (c === undefined
+                            || (c.message.text?.length ?? 0) + USER_IMAGE_PLACEHOLDER.length + 64 < anchor.b) continue;
+                        plan.claims.set(oldIds[k], [usable[k]]);
+                        claimedCandidates.add(usable[k]);
+                        plan.byImage++;
+                    }
+                }
+            };
+            familyClaim(stripVariants);
+            familyClaim(appendVariants);
+        }
     }
 
     for (const id of missing) {
@@ -595,7 +900,7 @@ export function planReconciliation(
     return plan;
 }
 
-function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string>): boolean {
+function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string[]>): boolean {
     if (claims.size === 0) return false;
     let touched = false;
     for (const block of blocks) {
@@ -604,10 +909,25 @@ function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string>): boolea
             if (list === undefined) continue;
             for (let i = 0; i < list.length; i++) {
                 const replacement = claims.get(list[i]);
-                if (replacement !== undefined) {
-                    list[i] = replacement;
+                if (replacement === undefined || replacement.length === 0) continue;
+                // Claims map 1→N (a merged core stands in for a reasoning+text
+                // pair) and N→1 (both pair members claim one merged witness).
+                // Splice the targets in and drop any already present — a
+                // block must never list the same message id twice. When the
+                // replacement is already in the list (the second member of an
+                // N→1 collapse), the old id is removed, not kept: two covered
+                // ids collapsing onto one live id is exactly the model-switch
+                // pair→merged shape (#2636).
+                const keep = replacement.filter((t) => !list.includes(t));
+                if (keep.length === 0) {
+                    list.splice(i, 1);
+                    i--;
                     touched = true;
+                    continue;
                 }
+                list.splice(i, 1, ...keep);
+                i += keep.length - 1;
+                touched = true;
             }
         }
     }
@@ -627,13 +947,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -646,9 +966,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -670,7 +990,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
-        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} byTool=${plan.byTool} byNorm=${plan.byNorm} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
+        process.stderr.write(`[fold-reconcile-dbg] blocks=${blocks.length} active=${active} covered=${covered.size} oldOrder=${oldOrder.length} positions=${positions?.canon.length ?? -1} missing=${plan.unmatched.length + plan.claims.size} claims=${plan.claims.size} byPos=${plan.byPos} byTool=${plan.byTool} byNorm=${plan.byNorm} byTurn=${plan.byTurn} byImage=${plan.byImage} unmatched=${plan.unmatched.length} | msgs[0..5]=${sample.join(" | ")}\n`);
     }
 
     // Seed/refresh anchors for covered ids present in this pass (including
@@ -679,6 +999,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // backbone forward to this pass.
     const byId = new Map<string, CoreMessage>();
     for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
+    // #2636: turn keys for freshly seeded anchors — built lazily so
+    // steady-state passes (no churn) never pay the per-core normalization
+    // (#2334). Only bare assistant cores can carry a turn key
+    // (turnContexts skips every other role), so the lookup is gated on that
+    // shape too: querying a user/tool anchor would build the map for
+    // nothing, every pass.
+    let turnCtx: Map<string, TurnCtx> | undefined;
+    const ctxOf = (id: string): TurnCtx | undefined => {
+        if (turnCtx === undefined) turnCtx = turnContexts(msgs);
+        return turnCtx.get(id);
+    };
+    const turnCtxFor = (message: CoreMessage | undefined): TurnCtx | undefined =>
+        message !== undefined && message.id !== undefined && message.role === "assistant"
+        && (message.toolCallId === undefined || message.toolCallId === "")
+            ? ctxOf(message.id) : undefined;
     const nextAnchors: Record<string, FoldAnchor> = {};
     let anchorCount = 0;
     for (const id of covered) {
@@ -693,9 +1028,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         if (anchorCount >= MAX_ANCHORS) break;
         const claimed = plan.claims.get(id);
         if (claimed !== undefined) {
-            const message = byId.get(claimed);
-            if (message !== undefined) {
-                nextAnchors[claimed] = anchorFrom(message);
+            for (const nid of new Set(claimed)) {
+                if (nextAnchors[nid] !== undefined) continue;
+                const message = byId.get(nid);
+                if (message === undefined) continue;
+                nextAnchors[nid] = anchorFrom(message, turnCtxFor(message));
                 anchorCount++;
             }
             continue;
@@ -714,6 +1051,17 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             if (prior.t !== undefined && prior.m === undefined) {
                 const message = byId.get(id);
                 nextAnchors[id] = message !== undefined ? anchorFrom(message) : prior;
+            } else if (prior.p === undefined && prior.r === "assistant" && prior.t === undefined) {
+                // #2636: anchor persisted before turn keys existed: backfill
+                // p/x while the bytes are still on the wire (same-id ⇒ same
+                // identity fields, so recomputing from live bytes is exact) —
+                // once per anchor, then reuse resumes (#2396 backfill
+                // pattern). Bare assistant anchors only: user/tool anchors
+                // never carry a turn key, so "p === undefined" is their
+                // steady shape — rebuilding them every pass would break the
+                // #2334 zero-work steady-state contract.
+                const message = byId.get(id);
+                nextAnchors[id] = message !== undefined ? anchorFrom(message, ctxOf(id)) : prior;
             } else {
                 nextAnchors[id] = prior;
             }
@@ -722,7 +1070,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         const message = byId.get(id);
         if (message !== undefined) {
-            nextAnchors[id] = anchorFrom(message);
+            nextAnchors[id] = anchorFrom(message, turnCtxFor(message));
             anchorCount++;
         }
     }
@@ -746,7 +1094,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     for (const block of blocks) {
         const bid = block.blockId;
         if (bid === undefined || bid === "") continue;
-        const ids = block.effectiveMessageIds ?? [];
+        // #2627: evidence counts REAL history only — separator ids can never
+        // be present or claimed, so including them in `t` would stall the
+        // ledger's p+r>=t accrual for polluted blocks forever.
+        const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
         if (ids.length === 0) continue;
         let p = 0, r = 0;
         for (const id of ids) {
@@ -755,9 +1106,68 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         const rec: FoldBlockCoverage = { p, r, t: ids.length };
         if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
+        // #2695: zombie streak — strict majority of covered ids absent, only
+        // for VERIFIED substrates (e === 1). Never-represent substrates keep
+        // their #2202 structural-absence semantics (no streak, no reap).
+        const gone = 2 * (p + r) < ids.length;
+        if (gone) {
+            if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
+        } else {
+            rec.z = 0;
+        }
         if (covCount >= MAX_ANCHORS) continue;
         nextCov[bid] = rec;
         covCount++;
+    }
+
+    // #2695: reap blocks whose covered substrate stayed majority-absent for
+    // FOLD_DRIFT_ESCALATE_PASSES consecutive passes. REMOVAL from
+    // state.blocks — not deactivation: syncBlocks re-activates any block
+    // whose id set still intersects the wire (kernel/src/sync.ts sets
+    // active=true before the stillPresent check), and duplicate-content
+    // re-derivation keeps exactly that intersection alive forever, which is
+    // how the zombie carrier kept rendering (and flapping) every turn.
+    // Proxy mode only (plugin folds legitimately replace covered history —
+    // the agent's own compress runs against its private state); repair mode
+    // only (warn observes). Runs BEFORE the backbone persistence below so
+    // the reaped ids are stripped from the same objects that get stored.
+    let reapedCount = 0;
+    if (mode === "repair" && session.metadata.pluginAgent === undefined) {
+        const ripe = new Set<string>();
+        for (const block of blocks) {
+            const bid = block.blockId;
+            if (bid !== undefined && (nextCov[bid]?.z ?? 0) >= FOLD_DRIFT_ESCALATE_PASSES) ripe.add(bid);
+        }
+        if (ripe.size > 0) {
+            const liveRawIds = new Set(msgs.map((m) => m.id));
+            const reaped = reapDestroyedSubstrate(session, ripe, liveRawIds, opts.log ?? (() => {}));
+            reapedCount = reaped.length;
+            if (reapedCount > 0) {
+                // Strip the reaped blocks from the coverage/backbone records
+                // this pass persists, so nothing seeds or positions their ids
+                // again (nextOrder is the array METADATA_POSITIONS already
+                // references — mutate in place).
+                const deadIds = new Set<string>();
+                for (const block of blocks) {
+                    if (block.blockId === undefined || !ripe.has(block.blockId)) continue;
+                    delete nextCov[block.blockId];
+                    for (const id of block.effectiveMessageIds ?? []) deadIds.add(id);
+                    for (const id of block.directMessageIds ?? []) deadIds.add(id);
+                }
+                for (const id of deadIds) delete nextAnchors[id];
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
+                }
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const positionIds = storedPositions?.ids;
+                if (Array.isArray(positionIds) && positionIds !== nextOrder) {
+                    for (let i = positionIds.length - 1; i >= 0; i--) {
+                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                    }
+                }
+                recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
+            }
+        }
     }
     session.metadata[METADATA_FOLD_COVERAGE] = nextCov;
 
@@ -771,7 +1181,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         // "already seen live", so remint leaves them and prune strips them as
         // covered. From this pass on the kernel maintains lastPassIds itself.
         const prior = new Set(session.state?.lastPassIds ?? []);
-        for (const newId of plan.claims.values()) prior.add(newId);
+        for (const targets of plan.claims.values()) {
+            for (const newId of targets) prior.add(newId);
+        }
         (session.state as { lastPassIds?: string[] }).lastPassIds = [...prior];
     }
 
@@ -814,15 +1226,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional, ${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional, ${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized) but reconcile=warn made no repair (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the
             // report — repeating this warn per pass contradicts the #2193
@@ -841,6 +1253,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byPos: plan.byPos,
         byTool: plan.byTool,
         byNorm: plan.byNorm,
+        byTurn: plan.byTurn,
+        byImage: plan.byImage,
+        reaped: reapedCount,
         unmatched: plan.unmatched.length,
     };
 }

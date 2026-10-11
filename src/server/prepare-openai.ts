@@ -11,7 +11,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
@@ -63,6 +63,10 @@ export async function prepareOpenai(
     let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
+    // #2483: single source for the effective render strategy — processTurn, the
+    // diag log and Prepared must all report what was actually rendered (the
+    // log label used to hardcode "text-only" and lie under renderNone).
+    const renderStrategy = knobRenderNone() ? "none" : "text-only";
 
     const maxTokens = typeof parsed.max_tokens === "number" ? parsed.max_tokens : 8192;
     // Title-generation requests (tiny max_tokens) get no compress tooling so
@@ -141,9 +145,12 @@ export async function prepareOpenai(
         // without framing falls through to detectUnannouncedHistoryRewrite.
         let dshRebased = false;
         if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
-            const coveredBeforeDshCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
+            const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks);
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+            // #2621: pass the pre-turn ref map so the framing match also demands
+            // NOVELTY — a freshly-landed checkpoint is a NEW id, while every
+            // historical quote/replay of the marker string hits an old id.
+            if (dshGap && carriesDshLocalCompactionSummary(msgs, knownRefsBefore)) {
                 const missing = dshGap.expected - dshGap.matched;
                 if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
                     recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
@@ -161,9 +168,9 @@ export async function prepareOpenai(
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
-            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            ? coveredRealHistoryIds(session.state.blocks)
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -188,7 +195,7 @@ export async function prepareOpenai(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
@@ -374,7 +381,7 @@ export async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

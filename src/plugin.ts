@@ -1613,6 +1613,13 @@ export async function handlePluginTool(
                 // (same values the wire path used), not the base kernelConfig.
                 config: effectiveConfig(session, deps.config),
                 messages,
+                // #2627: compress against the RAW history, not the processed
+                // outbound view — on the Responses wire that view carries the
+                // synthetic acp_turn_sep_* ordering separators, which would be
+                // registered into new blocks' coverage and read back as
+                // permanent drift against the client's unchanged history
+                // (same split as the relay loop ctx).
+                compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
@@ -2000,6 +2007,10 @@ export async function pipePluginChatWithStrip(
     let inRetry = false;
     let retryIndexOffset = 0;
     let blocksForwarded = 0;
+    // #2689: did the client receive the message_start that owns this turn's
+    // blocks? The #870 in-band error must not re-open a stream that never
+    // started (orphan block) — it asks the emitter instead of assuming.
+    let sawMessageStart = false;
     /** One-shot re-issue when a turn reaches its terminal with nothing visible:
      *  the tag-echo case, where the filter empties the only text block and the
      *  host aborts an empty completed turn. Returns true when the retry stream
@@ -2030,7 +2041,10 @@ export async function pipePluginChatWithStrip(
             // dead, so the client gets an error the host would never surface (#870).
             log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
             // #870 deliberately chose a COMPLETED turn carrying the error text (visible to the host); keep the legacy shape here regardless of the global streamErrorShape default.
-            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, "completion");
+            // #2689: hand the emitter the client-known stream state — the error
+            // block opens at the next free index (blocksForwarded), and no
+            // message_start is synthesized when the first attempt already sent one.
+            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, "completion", { blockIndex: blocksForwarded, messageStarted: sawMessageStart });
             return true;
         }
         // A turn the model left genuinely bare — no thought, no stripped echo,
@@ -2716,6 +2730,9 @@ export async function pipePluginChatWithStrip(
                     } else diagPushType("frame");
                     if (retryFraming(ev)) continue;
                     if (protocol === "anthropic" && ev["type"] === "content_block_start") blocksForwarded++;
+                    // After the retryFraming gate: only the first attempt's
+                    // message_start reaches here (the retry's was consumed).
+                    if (protocol === "anthropic" && ev["type"] === "message_start") sawMessageStart = true;
                     if (ev["type"] === "message_stop") sawTerminal = true;
                     if (ev["type"] === "message_delta") {
                         const d = ev["delta"] as Record<string, unknown> | undefined;

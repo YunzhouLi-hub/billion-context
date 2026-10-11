@@ -11,14 +11,15 @@ import {
 /** HTTP robustness helpers for the proxy.
 
   - readBody is capped: an unbounded request body is a memory-exhaustion
-    vector when the proxy listens publicly. 100 MB is generous for LLM
-    payloads (which can carry large tool results / file contents) while
-    still rejecting pathological sizes.
+    vector when the proxy listens publicly. Wire intake and rebuilt sends
+    stay capped at 100 MiB; recognized encoded requests have a separate,
+    bounded decode allowance before existing reductions run.
   - fetchWithTimeout wraps upstream requests with an AbortController so a
     stuck upstream cannot hold a client connection open forever. LLM
     streams can legitimately run for minutes, so the default is long. */
 
-export const MAX_REQUEST_BYTES = 100 * 1024 * 1024;
+export { MAX_REQUEST_BYTES } from "./request-body-budget.js";
+import { checkOutboundBody } from "./request-body-budget.js";
 export const UPSTREAM_TIMEOUT_MS = 12 * 60 * 1000;
 
 const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -127,6 +128,7 @@ export async function fetchWithTimeout(
     timeoutMs?: number,
     externalSignal?: AbortSignal,
 ): Promise<{ response: Response; clearTimer: () => void; stopIdleTimer: () => void }> {
+    checkOutboundBody(opts.body);
     const effective = timeoutMs ?? upstreamTimeoutMs();
     const controller = new AbortController();
     let cleared = false;

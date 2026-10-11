@@ -5,15 +5,15 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
-import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, stripHistoricalImages, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
+import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
 import { codexAlignedWindow } from "../codex-models.js";
-import { MAX_REQUEST_BYTES } from "../fetch-util.js";
+import { DecodedRequestAdmission, DecodedRequestBusyError, MAX_DECODED_REQUEST_BYTES } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
-import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
+import { buildIncomingImageIndex, pruneRetrieveImgExports, refreshIncomingImageIndex } from "../image-restore.js";
 import { durableMessageGuards } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -76,6 +76,33 @@ export async function handle(
     proxyWatchers: Set<number>,
     initialWatcherPid: number | null,
     adminCtx: Parameters<typeof handleAdminRoute>[2],
+): Promise<void> {
+    const admission = new DecodedRequestAdmission();
+    const decodingAbort = new AbortController();
+    const close = () => { if (!res.writableEnded) decodingAbort.abort(); };
+    res.on("close", close);
+    try {
+        await handleRequest(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx, admission, decodingAbort.signal);
+    } finally {
+        res.removeListener("close", close);
+        admission.release();
+    }
+}
+
+async function handleRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    opts: ProxyOptions,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    instanceId: string,
+    instanceStartedAt: number,
+    proxyWatchers: Set<number>,
+    initialWatcherPid: number | null,
+    adminCtx: Parameters<typeof handleAdminRoute>[2],
+    admission: DecodedRequestAdmission,
+    decodingSignal: AbortSignal,
 ): Promise<void> {
     // #1440 P2 cut 1: the /__bili/* + /__acp/* management surface (security gates +
     // endpoint dispatch) moved to src/server/admin.ts behind the loopback +
@@ -174,11 +201,11 @@ export async function handle(
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
         if (!passthroughMark && protocol !== null && bodyBuffer.length > 0) {
             try {
-                const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
+                const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_DECODED_REQUEST_BYTES, { signal: decodingSignal, onBytes: (bytes) => admission.observe(bytes) });
                 bodyBuffer = decoded.body;
                 if (decoded.decoded) delete req.headers["content-encoding"];
             } catch (decErr) {
-                if (decErr instanceof DecompressedTooLargeError) throw decErr;
+                if (decErr instanceof DecompressedTooLargeError || decErr instanceof DecodedRequestBusyError || decodingSignal.aborted) throw decErr;
                 // #619: bili can't decode this content-encoding -> don't 400. Drop
                 // protocol so the request falls to the verbatim passthrough below,
                 // relaying the ORIGINAL still-encoded bytes (the reassignment never
@@ -189,10 +216,17 @@ export async function handle(
             }
         }
     } catch (err) {
+        if (decodingSignal.aborted || res.destroyed) return;
+        if (err instanceof DecodedRequestBusyError) {
+            log("warn", "503: large decoded request budget is busy");
+            res.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
+            res.end(JSON.stringify({ error: { type: "request_body_busy", stage: "decode", message: err.message } }));
+            return;
+        }
         if (err instanceof BodyTooLargeError || err instanceof DecompressedTooLargeError) {
             log("warn", `413: request body exceeds ${err.limit} bytes`);
             res.writeHead(413, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
+            res.end(JSON.stringify({ error: { type: "request_too_large", stage: err instanceof BodyTooLargeError ? "receive" : "decode", message: err.message } }));
             return;
         }
         log("warn", `failed to prepare inbound request (${String(err)}) - 400`);
@@ -1828,28 +1862,15 @@ export async function handle(
                     }
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
-                    const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
-                    // #1995 gap 2: when an active fold exists (anthropic only —
-                    // see foldAnchoredCutoff for the id-stability proof), anchor
-                    // the strip boundary to fold coverage instead of the sliding
-                    // window so the stripped prefix is byte-stable between folds
-                    // and the prompt cache survives turn-over-turn. Falls back to
-                    // the sliding window when there is nothing to anchor to.
-                    const anchoredCutoff = cs.stripImages && protocol
-                        ? foldAnchoredCutoff(parsed, protocol, session.state)
-                        : undefined;
-                    const stripped = cs.stripImages
-                        ? stripHistoricalImages(parsed, protocol, keepRecent, anchoredCutoff !== undefined ? { cutoffIndex: anchoredCutoff } : undefined)
-                        : { body: parsed, removed: 0 };
                     // #1995/#2607: index recoverable historical images by ref from the RAW
-                    // inbound body on every request — archivable media now folds by default,
-                    // so decompress({ imageRef }) must reach those pixels even with
-                    // stripImages off; latest-wins per request. The post-prepare refresh
+                    // inbound body on every request — archivable media folds by default
+                    // and decompress({ imageRef }) must reach those pixels after they
+                    // leave the wire; latest-wins per request. The post-prepare refresh
                     // below merges in refs assigned during this turn's prepare.
-                    // count_tokens requests skip the (pure bookkeeping) index rebuild but
-                    // still strip with the same cutoff, so token counts stay representative
-                    // of what the model turn would send. Eviction rides along (best-effort,
-                    // throttled to once a minute).
+                    // (The former `stripImages` wire-side removal is gone — default
+                    // folding is the only path that drops media now. count_tokens
+                    // requests skip the (pure bookkeeping) index rebuild.)
+                    // Eviction rides along (best-effort, throttled to once a minute).
                     if (protocol && !countTokens) {
                         session.incomingImageIndex = buildIncomingImageIndex(parsed, protocol, session.state, session.id);
                         if (session.lastImgPrune === undefined || Date.now() - session.lastImgPrune > 60_000) {
@@ -1859,10 +1880,7 @@ export async function handle(
                     } else if (session.incomingImageIndex) {
                         session.incomingImageIndex = undefined;
                     }
-                    if (opts.debug && stripped.removed > 0) {
-                        log("info", `[debug] strip-images: dropped ${stripped.removed} historical image part(s), kept last ${keepRecent} (session=${session.id})`);
-                    }
-                    const work = stripped.body;
+                    const work = parsed;
                     if (countTokens) {
                         return protocol === "google"
                             ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session)
@@ -1879,11 +1897,10 @@ export async function handle(
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide)
                           : responsesCompact
-                            // #618 review nit: when no bili compaction item is present,
-                            // prepareResponsesCompact falls back to the raw bodyBuffer — forward
-                            // the re-serialized post-strip work instead so dropped images don't
-                            // ride along. Unchanged bodies keep the original buffer byte-identical.
-                            ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                            // #618: when no bili compaction item is present,
+                            // prepareResponsesCompact falls back to the raw bodyBuffer —
+                            // forward it unchanged (byte-identical passthrough).
+                            ? prepareResponsesCompact(bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
                             : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl, decide);
                 };
                 // #332: codex's native remote-compaction request (trigger form)

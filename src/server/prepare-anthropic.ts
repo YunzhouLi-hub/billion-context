@@ -9,7 +9,8 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -56,6 +57,18 @@ export async function prepareAnthropic(
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
+    // #2648: when the host pins a system block to cache_control.scope:"global",
+    // Anthropic renders tools BEFORE system, so the six ACP tools bili injects here
+    // (narrower scope) land ahead of a global block → upstream 400 ("scope:global …
+    // found after content with a narrower cache scope"). Global-scope caching is the
+    // host's own cross-prompt posture; bili's per-session injection cannot sit ahead
+    // of it, so stand down (forward untouched) rather than 400. Healthy main turns
+    // use ephemeral/unscoped system, so they keep full compression.
+    if (!pluginMode && hasGlobalScopeSystem(parsed)) {
+        log("info", `[${sessionId}] global-scope system passthrough (skipping compress injection, #2648)`);
+        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
     let processedMessages: CoreMessage[] = [];
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
@@ -66,6 +79,10 @@ export async function prepareAnthropic(
     let clientCacheControls: Map<string, unknown> | undefined;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
+    // #2483: single source for the effective render strategy — processTurn, the
+    // diag log and Prepared must all report what was actually rendered (the
+    // log label used to hardcode "text-only" and lie under renderNone).
+    const renderStrategy = knobRenderNone() ? "none" : "text-only";
 
     // #1085: sticky head-system anchor — freeze the client's own `system` text
     // at first sight and forward it byte-stable; detected changes ride as
@@ -159,6 +176,37 @@ export async function prepareAnthropic(
         // stamped per-request — strip `ccr` from the loop config when disarmed
         // (plugin mode / no tool channel) so placeholders never hit the wire.
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #2432/#2658: dsh desktop's native compaction can LAND without ever
+        // transiting bili — its summarizer calls ctx.llm.stream() directly and
+        // manual /compact / idle-session paths have no ALS attribution, so the
+        // plugin's takeover gate sends them DIRECT past the proxy. First notice
+        // = this request replaying [checkpoint summary, retained tail…] against
+        // the same session id. The openai/responses lanes rebase on that
+        // signature (#2432/#2451); this lane had the server-side REFUSAL gate
+        // but not the post-landing recovery, so any checkpoint landing here
+        // (direct bypass, allowDshCompaction, future gate mismatch) left the ACP
+        // state permanently unrebased — the cannot-be-anchored death spiral plus
+        // persistent prefix-cache loss (#2596). Same signature+rebase as the
+        // twin lanes: detection runs BEFORE reconcileFoldCoverage/processTurn;
+        // either signal alone stays on the existing paths (framing paste with
+        // intact history has no gap; a gap without framing falls through to
+        // detectUnannouncedHistoryRewrite below). Title-gen side requests are
+        // skipped like on the openai lane (same tiny-budget heuristic).
+        let dshRebased = false;
+        const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
+        if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
+            const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
+            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+                const missing = dshGap.expected - dshGap.matched;
+                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
+                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    markNativeCompactionBoundary(session);
+                    dshRebased = reconcileNativeCompactionBoundary(session);
+                }
+            }
+        }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
@@ -167,9 +215,9 @@ export async function prepareAnthropic(
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
-            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            ? coveredRealHistoryIds(session.state.blocks)
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: knobRenderNone() ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
@@ -194,7 +242,7 @@ export async function prepareAnthropic(
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
         }
-        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         // #2155: a self-heal-suppressed session (nudge idle / zombie fallback)
         // stops nagging — including the emergency path, per session.
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
@@ -202,8 +250,12 @@ export async function prepareAnthropic(
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
-        // deactivated the blocks whose sources left the context.
-        {
+        // deactivated the blocks whose sources left the context. Skipped when
+        // the rewrite was just classified as dsh native compaction above
+        // (#2432/#2658): it is already recorded as "native-compaction" and
+        // rebased — a second "unannounced-rewrite" entry beside it would present
+        // the substrate destruction as "another compressor fighting you".
+        if (!dshRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
@@ -352,7 +404,7 @@ export async function prepareAnthropic(
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: knobRenderNone() ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: renderStrategy, dropReasoning: stripReasoning } as Prepared;
 }
 
 
@@ -368,4 +420,13 @@ function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
     const stops = parsed.stop_sequences;
     if (!Array.isArray(stops)) return false;
     return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
+}
+
+// #2648: true when any system block pins cache_control.scope:"global". bili's
+// narrower-scope ACP-tool injection renders ahead of such a block and 400s
+// upstream (see the passthrough gate above), so the host must be left untouched.
+function hasGlobalScopeSystem(parsed: AnthropicRequestBody): boolean {
+    const sys = parsed.system;
+    if (!Array.isArray(sys)) return false;
+    return sys.some((b) => (b.cache_control as { scope?: unknown } | undefined)?.scope === "global");
 }

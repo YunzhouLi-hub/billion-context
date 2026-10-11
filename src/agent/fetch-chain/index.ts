@@ -159,6 +159,12 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
     // our downstream and model traffic keeps routing through bili.
     const desc = Object.getOwnPropertyDescriptor(globalThis, "fetch");
     let rearmCount = 0;
+    // #2685: true once this install cycle adopted a recognized pi-web-access
+    // wrapper. Its own guard (marker passthrough, #2435) makes the first adopt
+    // the only one, so the FIRST marked install is a supported coexistence
+    // handshake, not an evict. A LATER marked install is abnormal and keeps the
+    // full warning — the flag never blanket-suppresses the diagnostic channel.
+    let webAccessAdopted = false;
     const REARM_LIMIT = 16;
     const guard = desc === undefined || desc.configurable;
     let top = makeChain(orig);
@@ -174,19 +180,29 @@ export function installFetchChain(makeDispatch: (send: typeof globalThis.fetch) 
                 // recognize it by marker and ignore, never spend re-arm
                 // budget on ourselves.
                 if (isOwnChain(v)) return;
-                // Visibility (#1158): an evict attempt used to be silent —
-                // log it so "un-routed by a third party" is diagnosable.
-                // Past REARM_LIMIT the WARNING stops (log spam), but the
-                // adoption continues: #1662 showed that surrendering the top
-                // slot past the limit (`top = v`) left every later foreign
-                // install stacking on the orphaned chain with ZERO visibility
-                // — unbounded growth, silent, until the host process died.
-                // With the re-entry termination in makeChain each further
-                // adopt costs O(1) per request regardless of history length,
-                // so the cap now bounds LOGGING only, and routing authority
-                // never leaves the guard.
-                if (rearmCount < REARM_LIMIT) {
-                    console.warn(`[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (evict attempt ${rearmCount + 1})`);
+                // #2685: a recognized pi-web-access wrapper is a SUPPORTED
+                // coexistence install, not an evict — its first adopt is a quiet
+                // handshake (neutral note, no alarm). Post-#1158-self-heal the
+                // guard ALWAYS re-adopts, so routing authority never actually
+                // leaves; "evict" was the pre-self-heal framing and is dropped
+                // from the wording. Unknown wrappers and any LATER (repeat /
+                // abnormal) marked install keep the full diagnostic below.
+                const webAccess = Reflect.get(v, "__piWebAccessProxyFetch") === true;
+                // Visibility (#1158): a third-party install used to be silent —
+                // log it so "un-routed by a third party" is diagnosable. Past
+                // REARM_LIMIT the WARNING stops (log spam), but the adoption
+                // continues: #1662 showed that surrendering the top slot past
+                // the limit (`top = v`) left every later foreign install stacking
+                // on the orphaned chain with ZERO visibility — unbounded growth,
+                // silent, until the host process died. With the re-entry
+                // termination in makeChain each further adopt costs O(1) per
+                // request regardless of history length, so the cap now bounds
+                // LOGGING only, and routing authority never leaves the guard.
+                if (webAccess && !webAccessAdopted) {
+                    webAccessAdopted = true;
+                    console.log("[bili-native] adopted pi-web-access proxy fetch as downstream (supported coexistence, #2435)");
+                } else if (rearmCount < REARM_LIMIT) {
+                    console.warn(`[bili-native] third-party globalThis.fetch install detected (#1158) — re-chaining as downstream (install ${rearmCount + 1})`);
                 }
                 rearmCount += 1;
                 noteFetch(v);

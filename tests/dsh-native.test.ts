@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -343,7 +343,9 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
 
 type MockTool = { name: string; description?: string; inputSchema: unknown };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+type NameCall = { conversationId: string; name: string };
+
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -353,6 +355,19 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     ];
     return (req, res) => {
         const url = req.url ?? "";
+        if (url === "/__bili/plugin/session-name") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                if (nameCalls !== undefined) {
+                    const parsed = JSON.parse(body) as { conversationId?: unknown; name?: unknown };
+                    nameCalls.push({ conversationId: typeof parsed.conversationId === "string" ? parsed.conversationId : "", name: typeof parsed.name === "string" ? parsed.name : "" });
+                }
+                res.writeHead(nameStatus ?? 200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true }));
+            });
+            return;
+        }
         if (url === "/__bili/plugin/manifest") {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ version: "0.1.119", tools: { anthropic: manifestTools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema })) } }));
@@ -385,8 +400,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
@@ -442,7 +457,29 @@ function mockCtx() {
     let agentDefaultModel: { currentSelection?: () => { provider?: string; model?: string } | undefined } | undefined = undefined;
     // #1772 profile diagnostics: replayed through the same dynamic inject path.
     let profileContext: { startedBundles?: readonly string[] } | undefined = undefined;
+    // #2604: host-title channel fakes — session store + folded-title source,
+    // replayed through the same dynamic ctx.inject path production uses.
+    let dshSessions: Map<string, { id: string }> | undefined = undefined;
+    let dshTitleFold: ((id: string) => string | undefined) | undefined = undefined;
     type HostCtx = Parameters<typeof apply>[0];
+    type HostListener = Parameters<NonNullable<PluginContext["on"]>>[1];
+    const listeners: Record<string, HostListener[]> = {};
+    // Stable service identities (like real cordis services: one facade per
+    // process whose state mutates underneath); getters gate exposure on the
+    // backing fakes so T4's no-services degradation still reads absent.
+    const sessionsService: NonNullable<PluginContext["sessions"]> = {
+        get: (id: string) => dshSessions?.get(id),
+        list: () => (dshSessions === undefined ? [] : [...dshSessions.values()]),
+    };
+    const titleService: NonNullable<PluginContext["sessionTitle"]> = {
+        get: (session: unknown) => {
+            const fold = dshTitleFold;
+            if (fold === undefined) return undefined;
+            const s = session as { id?: unknown };
+            const t = typeof s.id === "string" ? fold(s.id) : undefined;
+            return t === undefined ? undefined : { title: t };
+        },
+    };
     return {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
         commands: { register: (c: { name: string; handler: (invocation?: { agent?: { session?: { id?: unknown } } }) => Promise<{ kind: string; text: string }> }) => commands.push(c) },
@@ -450,12 +487,28 @@ function mockCtx() {
         setInitiator: (i: { session?: { id?: unknown; requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
+        on: (event: string, listener: HostListener) => { (listeners[event] ??= []).push(listener); },
+        emit: (event: string, ...args: unknown[]) => { for (const l of listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args); },
+        get sessions(): PluginContext["sessions"] { return dshSessions !== undefined ? sessionsService : undefined; },
+        get sessionTitle(): PluginContext["sessionTitle"] { return dshTitleFold !== undefined ? titleService : undefined; },
+        setDshSessions: (store: Map<string, { id: string }> | undefined, fold: ((id: string) => string | undefined) | undefined) => {
+            dshSessions = store;
+            dshTitleFold = fold;
+        },
         inject: (deps: readonly string[], callback: (sub: HostCtx) => void) => {
             if (deps.includes("llm") && deps.includes("agentDefaultModel") && llm !== undefined && agentDefaultModel !== undefined) {
                 callback({ llm, agentDefaultModel } as HostCtx);
             }
             if (deps.includes("profileContext") && profileContext !== undefined) {
                 callback({ profileContext } as HostCtx);
+            }
+            if (deps.includes("sessions") || deps.includes("sessionTitle")) {
+                if (dshSessions !== undefined || dshTitleFold !== undefined) {
+                    const sub: Partial<HostCtx> = {};
+                    if (dshSessions !== undefined) sub.sessions = sessionsService;
+                    if (dshTitleFold !== undefined) sub.sessionTitle = titleService;
+                    callback(sub as HostCtx);
+                }
             }
         },
         setModelServices: (l: typeof llm, a: typeof agentDefaultModel) => {
@@ -1776,6 +1829,182 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
+    }
+});
+
+// — #2604 host-title channel ————————————————————————————————————————————————
+
+test("#2604: session/title events push the host name to /__bili/plugin/session-name; deduped, rename re-pushes", async () => {
+    const names: NameCall[] = [];
+    const proxy = await startMockProxy([], undefined, names);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-title-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetTitlesForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+
+            ctx.emit("session/event", { id: "s-t1" }, { type: "session/title", data: { title: "My Session", messageSeqs: [1], source: { kind: "user" } } });
+            await waitFor(() => names.length === 1, "title POST");
+            assert.deepEqual(names[0], { conversationId: "s-t1", name: "My Session" });
+
+            // duplicate event for the same name is suppressed
+            ctx.emit("session/event", { id: "s-t1" }, { type: "session/title", data: { title: "My Session", messageSeqs: [1], source: { kind: "user" } } });
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(names.length, 1);
+
+            // a rename re-pushes
+            ctx.emit("session/event", { id: "s-t1" }, { type: "session/title", data: { title: "Renamed", messageSeqs: [1, 2], source: { kind: "user" } } });
+            await waitFor(() => names.length === 2, "rename POST");
+            assert.deepEqual(names[1], { conversationId: "s-t1", name: "Renamed" });
+
+            // non-title events and empty titles are ignored
+            ctx.emit("session/event", { id: "s-t1" }, { type: "message/append", data: {} });
+            ctx.emit("session/event", { id: "s-t1" }, { type: "session/title", data: { title: "" } });
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(names.length, 2);
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetTitlesForTest();
+    }
+});
+
+test("#2604: a failed title POST re-arms the dedup so the next event retries", async () => {
+    const names: NameCall[] = [];
+    const proxy = await startMockProxy([], undefined, names, 500);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-title-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetTitlesForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+
+            ctx.emit("session/event", { id: "s-t2" }, { type: "session/title", data: { title: "A", messageSeqs: [1], source: { kind: "fallback" } } });
+            await waitFor(() => names.length === 1, "first POST");
+            // the 500 deleted the dedup entry — the same title retries
+            ctx.emit("session/event", { id: "s-t2" }, { type: "session/title", data: { title: "A", messageSeqs: [1], source: { kind: "fallback" } } });
+            await waitFor(() => names.length === 2, "retry POST");
+            assert.deepEqual(names[1], { conversationId: "s-t2", name: "A" });
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetTitlesForTest();
+    }
+});
+
+test("#2604: live sessions seed their folded title at boot; resumed sids re-label on first stamped traffic", async () => {
+    const names: NameCall[] = [];
+    const proxy = await startMockProxy([], undefined, names);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-title-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetTitlesForTest();
+            const ctx = mockCtx();
+            ctx.setDshSessions(new Map([["s-seed", { id: "s-seed" }]]), (id) => (id === "s-seed" ? "Seeded Title" : undefined));
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+
+            // the boot sweep seeds whatever is already live (resume published before us)
+            await waitFor(() => names.length === 1, "boot sweep POST");
+            assert.deepEqual(names[0], { conversationId: "s-seed", name: "Seeded Title" });
+
+            // a session whose title events all predate this process: no event
+            // fires again, so the FIRST stamped request must re-label it lazily
+            ctx.setDshSessions(
+                new Map([["s-seed", { id: "s-seed" }], ["s-resume", { id: "s-resume" }]]),
+                (id) => (id === "s-resume" ? "Resumed Title" : undefined),
+            );
+            ctx.setInitiator({ session: { id: "s-resume" } });
+            const headers = _stateHeadersForTest()!("http://example.invalid/anthropic/v1/messages");
+            assert.notEqual(headers, undefined);
+            assert.equal(headers?.["x-bili-plugin-conversation"], "s-resume");
+            await waitFor(() => names.some((n) => n.conversationId === "s-resume"), "lazy re-label POST");
+            assert.deepEqual(names.find((n) => n.conversationId === "s-resume"), { conversationId: "s-resume", name: "Resumed Title" });
+
+            // a second stamped request hits the armed dedup key — no re-POST
+            _stateHeadersForTest()!("http://example.invalid/anthropic/v1/messages");
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(names.filter((n) => n.conversationId === "s-resume").length, 1);
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetTitlesForTest();
+    }
+});
+
+test("#2604: without the dsh-session services the channel degrades silently; event payloads still push", async () => {
+    const names: NameCall[] = [];
+    const proxy = await startMockProxy([], undefined, names);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-title-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetTitlesForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+
+            // session/created with no folded source: no crash, no POST
+            ctx.emit("session/created", { id: "s-none" });
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(names.length, 0);
+
+            // but a session/title event carries its own payload — still pushed
+            ctx.emit("session/event", { id: "s-none" }, { type: "session/title", data: { title: "Event Title", messageSeqs: [1], source: { kind: "provider" } } });
+            await waitFor(() => names.length === 1, "event POST");
+            assert.deepEqual(names[0], { conversationId: "s-none", name: "Event Title" });
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetTitlesForTest();
+    }
+});
+
+test("#2604: a base transition re-arms the dedup — the replacement proxy re-learns titles", async () => {
+    const namesA: NameCall[] = [];
+    const proxyA = await startMockProxy([], undefined, namesA);
+    const namesB: NameCall[] = [];
+    const proxyB = await startMockProxy([], undefined, namesB);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-title-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxyA.origin }, async () => {
+            _resetRegisterForTest(proxyA.origin);
+            _resetTitlesForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+
+            ctx.emit("session/event", { id: "s-b" }, { type: "session/title", data: { title: "Shared", messageSeqs: [1], source: { kind: "user" } } });
+            await waitFor(() => namesA.length === 1, "POST to A");
+
+            // the owning proxy was replaced (respawn/rebind): the fresh base
+            // keys a fresh dedup namespace, so the next event lands on B
+            _resetRegisterForTest(proxyB.origin);
+            process.env.BILLION_CONTEXT_PROXY = proxyB.origin;
+            ctx.emit("session/event", { id: "s-b" }, { type: "session/title", data: { title: "Shared", messageSeqs: [1], source: { kind: "user" } } });
+            await waitFor(() => namesB.length === 1, "POST to B");
+            assert.deepEqual(namesB[0], { conversationId: "s-b", name: "Shared" });
+        });
+    } finally {
+        proxyA.close();
+        proxyB.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+        _resetTitlesForTest();
     }
 });
 
