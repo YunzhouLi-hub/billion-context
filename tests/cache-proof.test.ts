@@ -228,6 +228,32 @@ const elText = (buf: Buffer, L: Layout, i: number): string => {
     return buf.subarray(s, e).toString("utf8");
 };
 
+// Text blocks of a message element, normalized across the four wires'
+// shapes (chat/anthropic content string or content blocks, google parts,
+// responses message items). Carriers ride as dedicated blocks on chat but
+// are APPENDED to the anchor message's content array on anthropic/google,
+// so carrier identity is compared at BLOCK granularity: exact block-text
+// equality, no fuzzy matching, no anchor-prefix sensitivity.
+const elBlocks = (buf: Buffer, L: Layout, i: number): string[] => {
+    let el: unknown;
+    try { el = JSON.parse(elText(buf, L, i)); } catch { return [elText(buf, L, i)]; }
+    if (el === null || typeof el !== "object") return [elText(buf, L, i)];
+    const e = el as Record<string, unknown>;
+    const blockText = (b: unknown): string => (b !== null && typeof b === "object" && typeof (b as Record<string, unknown>).text === "string" ? (b as Record<string, unknown>).text as string : "");
+    if (Array.isArray(e.parts)) return e.parts.map(blockText);
+    if (typeof e.content === "string") return [e.content];
+    if (Array.isArray(e.content)) return e.content.map(blockText);
+    if (typeof e.text === "string") return [e.text];
+    return [elText(buf, L, i)];
+};
+const bodyBlocks = (i: number, bodies: string[], field: string): string[] => {
+    const B = Buffer.from(bodies[i]!, "utf8");
+    const L = layoutOf(B, field);
+    const out: string[] = [];
+    for (let j = 0; j < L.elems.length; j++) out.push(...elBlocks(B, L, j));
+    return out;
+};
+
 function leadingEqual(prev: Buffer, cur: Buffer, P: Layout, C: Layout): number {
     const n = Math.min(P.elems.length, C.elems.length);
     let k = 0;
@@ -1089,13 +1115,14 @@ test("cache proof (degenerate refetch, chat wire): re-request is a pure tail app
  *    - the pipeline re-arms: once the compacted history regrows past the
  *      threshold, a fresh fold lands as a clean FOLD-A/FOLD-B transition
  *      (self-heal, not a silent full replay). */
-test("cache proof (host compaction, chat wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "proof-decim-"));
+async function driveHostCompact(wire: Wire, ctx: number): Promise<void> {
+    const sessionId = `proof-decim-${wire}`;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `proof-decim-${wire}-`));
     const prevXdg = process.env.XDG_STATE_HOME;
     process.env.XDG_STATE_HOME = tmp;
     delete process.env.ACP_DUMP_BODY;
     const bodies: string[] = [];
-    const state: JudgeState = { wire: "chat", bodies, urls: [], turn: 0, destroyOnNext: false, tagOnlyNext: false, suppressTrigger: false };
+    const state: JudgeState = { wire, bodies, urls: [], turn: 0, destroyOnNext: false, tagOnlyNext: false, suppressTrigger: false };
     // minTurns=8 (not MIN_FOLD_T=11): this scenario has no scripted pre-fold
     // events to protect, and the regrowth phase needs the seed folds to land
     // early enough that decimation provably destroys ACTIVE folds.
@@ -1115,30 +1142,49 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
         // decimated body regains enough refs fast for the trigger's
         // refs>=12 gate — the re-arm must happen within the scripted turns.
         proxy = await startServer({
-            ...proofProxyOptions(upstreamPort, 200_000, true),
+            ...proofProxyOptions(upstreamPort, ctx, true),
             compress: { injectTool: true, injectNudge: true, nudgeGrowthTokens: 500 },
         });
         await listen(proxy);
         const proxyPort = (proxy.address() as { port: number }).port;
-        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
-        const hist: Item[] = [{ role: "system", content: "You are a coding agent operating in a sandbox." }];
+        const url = wire === "responses" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`
+            : wire === "anthropic" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`
+            : wire === "google" ? `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1beta/models/${MODEL_A}:streamGenerateContent?alt=sse`
+            : `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
+        const hist: Item[] = [];
+        const pushUser = (text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", role: "user", content: text });
+            else if (wire === "google") hist.push({ role: "user", parts: [{ text }] });
+            else hist.push({ role: "user", content: text });
+        };
+        const pushAssistant = (t: number, text: string): void => {
+            if (wire === "responses") hist.push({ type: "message", id: `msg_a${t}`, role: "assistant", content: text });
+            else if (wire === "google") hist.push({ role: "model", parts: [{ text }] });
+            else hist.push({ role: "assistant", content: text });
+        };
+        const makePayload = (): Item =>
+            wire === "responses" ? { model: MODEL_A, stream: true, instructions: "You are a test assistant.", input: [...hist] }
+            : wire === "anthropic" ? { model: MODEL_A, max_tokens: 1024, stream: true, system: "You are a test assistant.", messages: [...hist] }
+            : wire === "google" ? { contents: [...hist], systemInstruction: { parts: [{ text: "you are a test assistant" }] }, generationConfig: { maxOutputTokens: 4096 } }
+            : { model: MODEL_A, stream: true, messages: [...hist] };
         const send = async (t: number, suppress: boolean): Promise<void> => {
             state.turn = t;
             state.suppressTrigger = suppress;
-            const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "proof-decim" }, body: JSON.stringify({ model: MODEL_A, stream: true, messages: [...hist] }) });
-            if (!res.ok) throw new Error(`decim turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-            const reply = extractReply("chat", await res.text());
-            if (reply) hist.push({ role: "assistant", content: reply });
+            const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sessionId }, body: JSON.stringify(makePayload()) });
+            if (!res.ok) throw new Error(`${wire} decim turn ${t}: HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+            const reply = extractReply(wire, await res.text());
+            if (reply) pushAssistant(t, reply);
             state.suppressTrigger = false;
         };
         // 1) seed: 12 fat turns — at least one proxy-side fold lands
+        if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
         for (let t = 0; t < 12; t++) {
-            hist.push({ role: "user", content: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) });
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
             await send(t, false);
         }
-        assert.ok(trigger.calls() >= 1, `seed must land >=1 fold (got ${trigger.calls()})`);
+        assert.ok(trigger.calls() >= 1, `${wire}: seed must land >=1 fold (got ${trigger.calls()})`);
         const seedFolds = trigger.calls();
-        // 2) decimate: [system, compacted head, retained tail] — fatter
+        // 2) decimate: [system?, compacted head, retained tail] — fatter
         // compacted base (≈34KB) so the regrowth phase crosses the 64KB
         // trigger threshold deterministically within the scripted turns
         const retainedUser = `Turn 10 recap: please analyze module 10. ` + FILLER(10, 8);
@@ -1152,31 +1198,31 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
         // development, noted in the PR body, deliberately not pinned here.)
         const retainedAssistant = "Retained tail: final analysis of module 11 delivered, integration green. " + FILLER(11, 8);
         hist.length = 0;
-        hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
-        hist.push({ role: "user", content: HOST_COMPACT + " " + FILLER(90, 8) });
-        hist.push({ role: "user", content: retainedUser });
-        hist.push({ role: "assistant", content: retainedAssistant });
+        if (wire === "chat") hist.push({ role: "system", content: "You are a coding agent operating in a sandbox." });
+        pushUser(HOST_COMPACT + " " + FILLER(90, 8));
+        pushUser(retainedUser);
+        pushAssistant(11, retainedAssistant);
         await send(12, true);
         const decimIdx = bodies.findIndex((b) => b.includes("HOST-COMPACTION"));
-        assert.ok(decimIdx > 0, "decimation body captured");
+        assert.ok(decimIdx > 0, `${wire}: decimation body captured`);
         // 3) regrow: enough turns to deterministically cross the threshold
         //    and let the fresh fold's round-2 settle (FOLD-B needs a body
         //    AFTER the round-2)
         for (let t = 13; t < 22; t++) {
-            hist.push({ role: "user", content: `Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6) });
+            pushUser(`Turn ${t}: please analyze module ${t}. ` + FILLER(t, 6));
             await send(t, false);
         }
         if (process.env.PROOF_DUMP) {
-            const dir = path.join(process.env.PROOF_DUMP, "decim");
+            const dir = path.join(process.env.PROOF_DUMP, `decim-${wire}`);
             fs.mkdirSync(dir, { recursive: true });
             bodies.forEach((b, idx) => fs.writeFileSync(path.join(dir, `${String(idx).padStart(3, "0")}.json`), b));
         }
-        assert.ok(trigger.calls() > seedFolds, `pipeline must re-arm after decimation (folds ${seedFolds} -> ${trigger.calls()})`);
+        assert.ok(trigger.calls() > seedFolds, `${wire}: pipeline must re-arm after decimation (folds ${seedFolds} -> ${trigger.calls()})`);
 
         // ---- classify every pair ----
         const lines: string[] = [];
-        const field = "messages";
-        const r2All = bodies.map((_, i) => i).filter((i) => isRound2Body("chat", JSON.parse(bodies[i]!) as Item));
+        const field = FIELD[wire];
+        const r2All = bodies.map((_, i) => i).filter((i) => isRound2Body(wire, JSON.parse(bodies[i]!) as Item));
         const r2s = new Set(r2All);
         const prev = bodies[decimIdx - 1]!;
         const cur = bodies[decimIdx]!;
@@ -1184,13 +1230,13 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
         const CB = Buffer.from(cur, "utf8");
         const P = layoutOf(PB, field);
         const C = layoutOf(CB, field);
-        assert.ok(headEq(PB, CB, P, C), `chat pair#${decimIdx}->#${decimIdx + 1}: head bytes mutated across host compaction`);
-        assert.ok(tailEq(PB, CB, P, C), `chat pair#${decimIdx}->#${decimIdx + 1}: post-array suffix mutated across host compaction`);
-        assert.ok(coreLen(CB, C) < coreLen(PB, P), `chat pair#${decimIdx}->#${decimIdx + 1}: decimated core must SHRINK (got ${coreLen(PB, P)} -> ${coreLen(CB, C)})`);
-        assert.ok(!cur.includes("Cache-proof fold summary"), `chat pair#${decimIdx}->#${decimIdx + 1}: destroyed folds' summary carriers lingered on the wire (orphan flapping, #2596)`);
-        assert.ok(cur.includes(HOST_COMPACT) && cur.includes("Turn 10 recap"), `chat pair#${decimIdx}->#${decimIdx + 1}: compacted view must be forwarded`);
-        assert.ok(!cur.includes("acp_loop_"), `chat pair#${decimIdx}->#${decimIdx + 1}: acp_loop_ artifact leaked`);
-        lines.push(`proof[chat] pair#${decimIdx}->#${decimIdx + 1} HOSTCOMPACT ok core=${coreLen(PB, P)}->${coreLen(CB, C)} carriers-dropped lcp=${lcpBytes(PB, CB)}/${CB.length} sha=${sha16(cur)}`);
+        assert.ok(headEq(PB, CB, P, C), `${wire} pair#${decimIdx}->#${decimIdx + 1}: head bytes mutated across host compaction`);
+        assert.ok(tailEq(PB, CB, P, C), `${wire} pair#${decimIdx}->#${decimIdx + 1}: post-array suffix mutated across host compaction`);
+        assert.ok(coreLen(CB, C) < coreLen(PB, P), `${wire} pair#${decimIdx}->#${decimIdx + 1}: decimated core must SHRINK (got ${coreLen(PB, P)} -> ${coreLen(CB, C)})`);
+        assert.ok(!cur.includes("Cache-proof fold summary"), `${wire} pair#${decimIdx}->#${decimIdx + 1}: destroyed folds' summary carriers lingered on the wire (orphan flapping, #2596)`);
+        assert.ok(cur.includes(HOST_COMPACT) && cur.includes("Turn 10 recap"), `${wire} pair#${decimIdx}->#${decimIdx + 1}: compacted view must be forwarded`);
+        assert.ok(!cur.includes("acp_loop_"), `${wire} pair#${decimIdx}->#${decimIdx + 1}: acp_loop_ artifact leaked`);
+        lines.push(`proof[${wire}] pair#${decimIdx}->#${decimIdx + 1} HOSTCOMPACT ok core=${coreLen(PB, P)}->${coreLen(CB, C)} carriers-dropped lcp=${lcpBytes(PB, CB)}/${CB.length} sha=${sha16(cur)}`);
         // #2695 bounded healing window: an unannounced host compaction
         // orphans fold blocks whose carriers may keep riding the wire until
         // the zombie-reap streak (3 majority-absent passes) removes them.
@@ -1202,30 +1248,12 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
         // every later fold round-2 — the bound below is the regression pin.
         const seedCarrierTexts = new Set<string>();
         for (let i = 0; i < decimIdx; i++) {
-            const B = Buffer.from(bodies[i]!, "utf8");
-            const L = layoutOf(B, field);
-            for (let j = 0; j < L.elems.length; j++) {
-                const t = elText(B, L, j);
+            for (const t of bodyBlocks(i, bodies, field)) {
                 if (t.includes(SUMMARY_MARKER)) seedCarrierTexts.add(t);
             }
         }
-        const bodyHasZombie = (i: number): boolean => {
-            const B = Buffer.from(bodies[i]!, "utf8");
-            const L = layoutOf(B, field);
-            for (let j = 0; j < L.elems.length; j++) {
-                const t = elText(B, L, j);
-                if (seedCarrierTexts.has(t)) return true;
-            }
-            return false;
-        };
-        const bodyHasCarrierText = (i: number, text: string): boolean => {
-            const B = Buffer.from(bodies[i]!, "utf8");
-            const L = layoutOf(B, field);
-            for (let j = 0; j < L.elems.length; j++) {
-                if (elText(B, L, j) === text) return true;
-            }
-            return false;
-        };
+        const bodyHasZombie = (i: number): boolean => bodyBlocks(i, bodies, field).some((t) => seedCarrierTexts.has(t));
+        const bodyHasCarrierText = (i: number, text: string): boolean => bodyBlocks(i, bodies, field).includes(text);
         // Kernel root-fix regression pin (#2695): the flap signature was a
         // zombie carrier toggling in/out across turns — new cluster
         // extensions kept re-occupying the dead block's covered ids and
@@ -1239,7 +1267,7 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
                 if (bodyHasCarrierText(i, t)) {
                     assert.ok(
                         !dropped,
-                        `seed carrier toggled back on body #${i} after dropping — zombie flap (kernel root-fix, #2695)`,
+                        `${wire}: seed carrier toggled back on body #${i} after dropping — zombie flap (kernel root-fix, #2695)`,
                     );
                     seen = true;
                 } else if (seen) {
@@ -1252,14 +1280,18 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
             if (i === decimIdx) continue; // decim body is clean by the pair assert above
             if (bodyHasZombie(i)) lastDirty = i;
         }
-        assert.ok(lastDirty > decimIdx, "scenario drifted: expected zombie carriers to ride at least one post-decimation body");
+        assert.ok(lastDirty > decimIdx, `${wire}: scenario drifted: expected zombie carriers to ride at least one post-decimation body`);
         const ZOMBIE_SETTLE_BOUND = 9; // bodies after decimIdx; measured with the reap active
-        assert.ok(lastDirty - decimIdx <= ZOMBIE_SETTLE_BOUND, `chat zombie flap not bounded: zombie carrier last seen on body #${lastDirty}, ${lastDirty - decimIdx} bodies after decimation #${decimIdx} (bound ${ZOMBIE_SETTLE_BOUND}, #2695)`);
+        assert.ok(lastDirty - decimIdx <= ZOMBIE_SETTLE_BOUND, `${wire}: zombie flap not bounded: zombie carrier last seen on body #${lastDirty}, ${lastDirty - decimIdx} bodies after decimation #${decimIdx} (bound ${ZOMBIE_SETTLE_BOUND}, #2695)`);
 
         let postFold = false;
         for (let i = 1; i < bodies.length; i++) {
             if (i === decimIdx) continue;
-            const inWindow = i > decimIdx && i <= lastDirty;
+            // The window extends ONE body past the last zombie sighting: the
+            // pair that DROPS the final zombie carrier is (lastDirty,
+            // lastDirty+1) and is classified at i = lastDirty+1 — the deletion
+            // itself is the bounded healing, not a divergence.
+            const inWindow = i > decimIdx && i <= lastDirty + 1;
             if (inWindow) {
                 if (r2s.has(i)) {
                     // Settling fold: the rearm round-2 may still carry zombie
@@ -1271,43 +1303,43 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
                     const RB = Buffer.from(bodies[i]!, "utf8");
                     const P = layoutOf(PB, field);
                     const R = layoutOf(RB, field);
-                    assert.ok(firstSummaryEl(RB, R) >= 0, `chat fold@req#${i}: rearm round-2 lacks its summary carrier (no self-heal)`);
-                    assert.ok(countSummaryEls(RB, R) <= countSummaryEls(PB, P) + 1, `chat fold@req#${i}: settling round-2 spawned a NEW zombie carrier (#2695)`);
-                    assert.ok(coreLen(RB, R) < coreLen(PB, P), `chat fold@req#${i}: rearm round-2 must shrink the core`);
-                    lines.push(`proof[chat] pair#${i - 1}->#${i} SETTLING-FOLD ok summaries=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)} (zombie ride bounded, #2695)`);
+                    assert.ok(firstSummaryEl(RB, R) >= 0, `${wire} fold@req#${i}: rearm round-2 lacks its summary carrier (no self-heal)`);
+                    assert.ok(countSummaryEls(RB, R) <= countSummaryEls(PB, P) + 1, `${wire} fold@req#${i}: settling round-2 spawned a NEW zombie carrier (#2695)`);
+                    assert.ok(coreLen(RB, R) < coreLen(PB, P), `${wire} fold@req#${i}: rearm round-2 must shrink the core`);
+                    lines.push(`proof[${wire}] pair#${i - 1}->#${i} SETTLING-FOLD ok summaries=${countSummaryEls(PB, P)}->${countSummaryEls(RB, R)} (zombie ride bounded, #2695)`);
                     postFold = true;
                 } else {
-                    lines.push(`proof[chat] pair#${i}->#${i + 1} SETTLING (bounded zombie churn, #2695)`);
+                    lines.push(`proof[${wire}] pair#${i}->#${i + 1} SETTLING (bounded zombie churn, #2695)`);
                 }
                 continue;
             }
             if (r2s.has(i)) {
-                checkFoldPre("chat", bodies, field, i, lines);
-                if (i + 1 < bodies.length && i + 1 !== decimIdx) checkFoldNext("chat", bodies, field, i, lines);
+                checkFoldPre(wire, bodies, field, i, lines);
+                if (i + 1 < bodies.length && i + 1 !== decimIdx) checkFoldNext(wire, bodies, field, i, lines);
                 if (i > decimIdx) postFold = true;
             } else if (r2s.has(i - 1)) {
                 continue; // classified by checkFoldNext above
             } else {
-                checkGrowth("chat", bodies, field, i, lines);
+                checkGrowth(wire, bodies, field, i, lines);
             }
         }
-        assert.ok(postFold, "post-decimation fold must occur (self-heal)");
+        assert.ok(postFold, `${wire}: post-decimation fold must occur (self-heal)`);
 
         // Direct teeth on the fix (#2695): the reap must have fired, archived
         // the orphaned block, and KEPT its content for derived decompress.
-        const session = getSession("proof-decim");
+        const session = getSession(sessionId);
         const reaps = conflictEventsOf(session).filter((e) => e.kind === "orphan-reap");
-        assert.ok(reaps.length > 0, "orphan-reap conflict event recorded (#2695)");
+        assert.ok(reaps.length > 0, `${wire}: orphan-reap conflict event recorded (#2695)`);
         const reapedIds = reaps.flatMap((e) => e.detail.match(/\[([^\]]+)\]/)?.[1]?.split(", ") ?? []);
-        assert.ok(reapedIds.length > 0, `orphan-reap detail names the reaped blocks (got: ${reaps[0]?.detail})`);
+        assert.ok(reapedIds.length > 0, `${wire}: orphan-reap detail names the reaped blocks (got: ${reaps[0]?.detail})`);
         for (const id of reapedIds) {
-            assert.ok(session.blockContents.has(id), `reaped block ${id} content retained for decompress (#395 semantics)`);
+            assert.ok(session.blockContents.has(id), `${wire}: reaped block ${id} content retained for decompress (#395 semantics)`);
             const coverage = session.metadata.foldCoverageByBlock as Record<string, unknown> | undefined;
-            assert.ok(!coverage || coverage[id] === undefined, `reaped block ${id} stripped from foldCoverageByBlock`);
+            assert.ok(!coverage || coverage[id] === undefined, `${wire}: reaped block ${id} stripped from foldCoverageByBlock`);
         }
-        lines.push(`proof[chat] REAP ok blocks=${reapedIds.join(",")} content-retained coverage-stripped`);
+        lines.push(`proof[${wire}] REAP ok blocks=${reapedIds.join(",")} content-retained coverage-stripped`);
         for (const l of lines) console.log(l);
-        console.log(`proof[chat-decim] VERDICT bodies=${bodies.length} decimIdx=${decimIdx} folds=${trigger.calls()} unexplainedDivergences=0`);
+        console.log(`proof[${wire}-decim] VERDICT bodies=${bodies.length} decimIdx=${decimIdx} folds=${trigger.calls()} unexplainedDivergences=0`);
     } finally {
         await closeServer(proxy);
         await closeServer(upstream);
@@ -1315,4 +1347,20 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
         else process.env.XDG_STATE_HOME = prevXdg;
         rmrf(tmp);
     }
+}
+
+test("cache proof (host compaction, chat wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("chat", 200_000);
+});
+
+test("cache proof (host compaction, anthropic wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("anthropic", 400_000);
+});
+
+test("cache proof (host compaction, responses wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("responses", 200_000);
+});
+
+test("cache proof (host compaction, google wire): decimated replay drops orphan carriers and re-arms cleanly", { timeout: 180_000 }, async () => {
+    await driveHostCompact("google", 1_000_000);
 });
