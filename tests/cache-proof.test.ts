@@ -1218,6 +1218,35 @@ test("cache proof (host compaction, chat wire): decimated replay drops orphan ca
             }
             return false;
         };
+        const bodyHasCarrierText = (i: number, text: string): boolean => {
+            const B = Buffer.from(bodies[i]!, "utf8");
+            const L = layoutOf(B, field);
+            for (let j = 0; j < L.elems.length; j++) {
+                if (elText(B, L, j) === text) return true;
+            }
+            return false;
+        };
+        // Kernel root-fix regression pin (#2695): the flap signature was a
+        // zombie carrier toggling in/out across turns — new cluster
+        // extensions kept re-occupying the dead block's covered ids and
+        // resurrecting it every other pass. With remint dodging inactive
+        // blocks, carrier visibility after decimation is MONOTONE: once a
+        // seed carrier drops off the wire it never comes back.
+        for (const t of seedCarrierTexts) {
+            let seen = false;
+            let dropped = false;
+            for (let i = decimIdx + 1; i < bodies.length; i++) {
+                if (bodyHasCarrierText(i, t)) {
+                    assert.ok(
+                        !dropped,
+                        `seed carrier toggled back on body #${i} after dropping — zombie flap (kernel root-fix, #2695)`,
+                    );
+                    seen = true;
+                } else if (seen) {
+                    dropped = true;
+                }
+            }
+        }
         let lastDirty = -1;
         for (let i = decimIdx; i < bodies.length; i++) {
             if (i === decimIdx) continue; // decim body is clean by the pair assert above
