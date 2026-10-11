@@ -97,7 +97,7 @@
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
-import { isResponsesTurnSeparatorId } from "./session.js";
+import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { recordConflict } from "./conflict-watch.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
@@ -496,21 +496,11 @@ interface BlockLike {
  *  (consumed into a newer fold, host-expanded, or drifted out of the resent
  *  history) by setting active=false while KEEPING its effectiveMessageIds —
  *  those dead-lineage ids can never re-anchor and would sit in `missing`
- *  permanently, inflating the drift warn ~2x (#2293). Same caliber as the
- *  #1195 pre-turn snapshot. */
+ *  permanently, inflating the drift warn ~2x (#2293). Delegates to
+ *  coveredRealHistoryIds so the single real-history caliber (#2627) is
+ *  implemented exactly once. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
-    // #2627: outbound-only turn separators (acp_turn_sep_*) are never in any
-    // resent history — counting them here would keep a permanent separator-
-    // only "missing" set alive on every pass. Same real-history caliber as
-    // the #1195 snapshot consumers.
-    const covered = new Set<string>();
-    for (const block of blocks) {
-        if (!block.active) continue;
-        for (const id of block.effectiveMessageIds ?? []) {
-            if (!isResponsesTurnSeparatorId(id)) covered.add(id);
-        }
-    }
-    return covered;
+    return coveredRealHistoryIds(blocks);
 }
 
 /** Pure core: plan the reconciliation between the previous pass order and the
