@@ -131,6 +131,64 @@ export function isDshCompactionCall(protocol: string | null, parsed: unknown): b
     return finalUser.trimStart().startsWith(DSH_COMPACTION_INSTRUCTION_PREFIX);
 }
 
+/** #2709: raw-ASCII sniff of the instruction marker — the first 48 bytes of
+ * DSH_COMPACTION_INSTRUCTION_PREFIX. Used as a cheap prefilter on the
+ * passthrough lane so ordinary background traffic (title-gen, plugin calls)
+ * never pays a JSON.parse; a hit still goes through the full marker-decisive
+ * check below, so a conversation that merely MENTIONS the instruction string
+ * in ordinary text does not false-positive (the real check requires the final
+ * user message to START with the prefix). */
+const DSH_COMPACTION_MARKER_SNIFF = DSH_COMPACTION_INSTRUCTION_PREFIX.slice(0, 48);
+
+/** #2709 process-level count of passthrough-lane refusals (no session exists
+ * on that lane, so the per-session #2490 ledger cannot record them). Exported
+ * mutable record for tests and future stats surfacing. */
+export const dshPassthroughGuardStats = { refusals: 0 };
+
+/** #2709: the passthrough lane (x-bili-passthrough, #1117) relays byte-untouched
+ * with "no session, no injection, no guard" — which made it the one lane dsh's
+ * agentless background compaction could still LAND through: the takeover gate
+ * refuses attribution for agentless callers while the settings overlay has
+ * already routed the URL to /bili/, so the native patch stamps the request and
+ * it relays verbatim BELOW the #1835 pipeline guard (field report: 45 refused
+ * through the pipeline, 4 landed through this lane). This runs the same
+ * marker-decisive detection on the passthrough body. Fail-open like #1835:
+ * anything undecodable/unparseable returns false and the request relays exactly
+ * as before. `decode` is supplied by the caller (bounded decode + admission
+ * accounting, reusing the standard request-body budget). */
+export async function detectPassthroughDshCompactionCall(
+    protocol: string | null,
+    bodyBuffer: Buffer,
+    contentEncoding: string | undefined,
+    decode: (encoding: string, body: Buffer) => Promise<Buffer>,
+): Promise<boolean> {
+    if (protocol === null) return false;
+    let candidate: Buffer | undefined;
+    if (bodyBuffer.includes(DSH_COMPACTION_MARKER_SNIFF)) {
+        candidate = bodyBuffer;
+    } else {
+        // A declared content-encoding hides the marker from the raw sniff —
+        // decode a bounded COPY (the relay below still forwards the original
+        // bytes; nothing here may reassign bodyBuffer or drop the header).
+        if (contentEncoding === undefined || contentEncoding === "" || contentEncoding === "identity") return false;
+        let decoded: Buffer;
+        try {
+            decoded = await decode(contentEncoding, bodyBuffer);
+        } catch {
+            return false;
+        }
+        if (!decoded.includes(DSH_COMPACTION_MARKER_SNIFF)) return false;
+        candidate = decoded;
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(candidate.toString("utf8"));
+    } catch {
+        return false;
+    }
+    return isDshCompactionCall(protocol, parsed);
+}
+
 // #2432: dsh compaction-basic's CHECKPOINT FRAMING — the single replacement
 // user message a LANDED compaction writes into the client's history
 // (CHECKPOINT_PREAMBLE + SUMMARY_OPEN_TAG … SUMMARY_CLOSE_TAG,
