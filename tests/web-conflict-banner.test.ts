@@ -270,3 +270,17 @@ test("banner wiring: conflicts-banner branch renders bili_conflictLine (drift gu
     const occurrences = WEB_CLIENT.split(" event(s) in ").length - 1;
     assert.equal(occurrences, 1, "'event(s) in' phrasing lives only inside bili_conflictLine");
 });
+
+test("#2709 inferred native-compaction landing counts as CONFIRMED, not an unconfirmed signal", () => {
+    const sev = bannerSeverity();
+    // inferred-only must reach the confirmed-native tier (client mirror of the server ladder)
+    const inferred = sev({ events: 2, sessions: 1, active: 2, historical: 0, kinds: { "native-compaction-inferred": 2 }, latest: [{ kind: "native-compaction-inferred", detail: "framing absent [inferred]" }] });
+    assert.strictEqual(inferred.hasConfirmed, true);
+    assert.strictEqual(inferred.onKey, "conflict.on");
+    assert.strictEqual(inferred.riskKey, "conflict.risk_active");
+    // contrast: a plain unannounced rewrite stays UNCONFIRMED (no false positive)
+    const unannounced = sev({ events: 2, sessions: 1, active: 2, historical: 0, kinds: { "unannounced-rewrite": 2 }, latest: [{ kind: "unannounced-rewrite", detail: "x/y incoming carry pre-turn refs" }] });
+    assert.strictEqual(unannounced.hasConfirmed, false);
+    assert.strictEqual(unannounced.onKey, "conflict.on_unconfirmed");
+    assert.strictEqual(unannounced.riskKey, "conflict.risk_unconfirmed");
+});
