@@ -29,7 +29,7 @@ import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
-import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { checkForUpdate, fetchRegistryVersion, startAutoUpdate } from "./update.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
@@ -39,6 +39,7 @@ import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launche
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { renderDoctorReport, runDoctor } from "./doctor.js";
+import { auditDshProfileCopyProvenance } from "./provenance.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
@@ -671,4 +672,22 @@ export async function main(): Promise<void> {
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
         });
     }
+    // #3160: loud provenance detection for dsh profile copies. Detached and
+    // fail-open by contract — a wedged copy must never delay or break
+    // startup, and the check itself only reads state (no install action), so
+    // it stays out of src/update.ts's no-op-release prerequisite.
+    void (async () => {
+        try {
+            await auditDshProfileCopyProvenance({
+                log: loggerLog,
+                fetchRegistryVersion: () =>
+                    fetchRegistryVersion(
+                        { resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback), updateTag: opts.updateTag },
+                        PACKAGE_NAME,
+                    ),
+            });
+        } catch {
+            // detection is advisory — never affect startup
+        }
+    })();
 }
